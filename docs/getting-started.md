@@ -56,43 +56,76 @@ To stop everything: `docker compose down` (add `-v` to also drop the Postgres vo
 
 Every Python service is `FROM python:3.12-slim`, installs its own `requirements.txt`, and is run with Uvicorn (see each `Dockerfile`). `ui` is plain static files served by nginx — no build step.
 
-## 3. Running one service standalone (active development)
+## 3. Running the services one by one (active development, no shortcuts)
 
-The usual pattern: keep everything *except* the service you're actively changing running in Docker, run that one service on the host with `--reload` so edits take effect instantly, and repoint it at the Dockerized dependencies via `localhost`.
+This is the full manual walkthrough — bring each service up standalone, in dependency order, verifying each with a health check before starting the next. Useful when you're actively developing one service and want `--reload` on it, or just want to understand the stack piece by piece. If you just want everything running, use §1 instead.
 
-### Orchestrator (most common — this is where the agent/graph logic lives)
+Every step assumes you're at the repo root unless a step says `cd`. On Windows PowerShell, replace `export VAR=value` with `$env:VAR = "value"` and `. .venv/Scripts/activate` for the venv activation (already correct as written below); on macOS/Linux use `source .venv/bin/activate`.
+
+### 1. `db` — Postgres
+
+Everything else depends on this, and it's the one piece not worth running outside Docker (schema-per-mocked-system init scripts under `db/init/` run automatically on first boot).
 
 ```bash
-docker compose up -d db mock-bluemarble mock-salesforce gateway-mcp
-
-cd services/orchestrator
-python -m venv .venv && . .venv/Scripts/activate   # or source .venv/bin/activate on macOS/Linux
-pip install -r requirements.txt
-
-# Env vars — gateway-mcp's container port is published to the host at 8090
-export GATEWAY_MCP_URL=http://localhost:8090/mcp
-export GATEWAY_API_KEY=dev-gateway-key-change-me   # must match .env's GATEWAY_API_KEY
-export AWS_REGION=eu-west-1
-export BEDROCK_MODEL_ID=anthropic.claude-3-5-sonnet-20241022-v2:0
-# AWS credentials: exported env vars, or your default ~/.aws profile — boto3's normal chain
-
-uvicorn app.api:app --reload --port 8000
+cp .env.example .env   # if you haven't already — this is where POSTGRES_* come from
+docker compose up -d db
 ```
 
-(PowerShell: use `$env:GATEWAY_MCP_URL = "http://localhost:8090/mcp"` etc. instead of `export`.)
+Verify:
+```bash
+docker compose ps db          # should show "healthy"
+```
 
-### Gateway (MCP server + middleware)
+### 2. `mock-bluemarble` — catalog + order management mock (port 8081)
+
+Depends on: `db`.
 
 ```bash
-docker compose up -d db mock-bluemarble mock-salesforce
+cd services/mock-bluemarble
+python -m venv .venv && . .venv/Scripts/activate
+pip install -r requirements.txt
 
+export POSTGRES_USER=vz_poc POSTGRES_PASSWORD=change-me-locally POSTGRES_DB=vz_poc
+export POSTGRES_HOST=localhost POSTGRES_PORT=5432   # host, not "db" — you're outside the compose network here
+
+uvicorn app.main:app --reload --port 8081
+```
+
+Verify: `curl http://localhost:8081/health` → `{"status": "ok"}`.
+
+(Or skip the venv and just run it in Docker: `docker compose up -d mock-bluemarble`.)
+
+### 3. `mock-salesforce` — case management mock (port 8082)
+
+Depends on: `db`. Same shape as step 2:
+
+```bash
+cd services/mock-salesforce
+python -m venv .venv && . .venv/Scripts/activate
+pip install -r requirements.txt
+
+export POSTGRES_USER=vz_poc POSTGRES_PASSWORD=change-me-locally POSTGRES_DB=vz_poc
+export POSTGRES_HOST=localhost POSTGRES_PORT=5432
+
+uvicorn app.main:app --reload --port 8082
+```
+
+Verify: `curl http://localhost:8082/health` → `{"status": "ok"}`.
+
+(Or: `docker compose up -d mock-salesforce`.)
+
+### 4. `gateway-mcp` — MCP server + AuthN/rate-limit/idempotency/audit (port 8090)
+
+Depends on: `db`, `mock-bluemarble`, `mock-salesforce` (steps 1–3 must be reachable first).
+
+```bash
 cd services/gateway-mcp
 python -m venv .venv && . .venv/Scripts/activate
 pip install -r requirements.txt
 
 export POSTGRES_USER=vz_poc POSTGRES_PASSWORD=change-me-locally POSTGRES_DB=vz_poc
-export POSTGRES_HOST=localhost POSTGRES_PORT=5432   # host, not "db" — you're outside the compose network now
-export GATEWAY_API_KEY=dev-gateway-key-change-me
+export POSTGRES_HOST=localhost POSTGRES_PORT=5432
+export GATEWAY_API_KEY=dev-gateway-key-change-me   # must match what you'll export for orchestrator in step 5
 export GATEWAY_RATE_LIMIT_PER_MIN=60
 export BLUEMARBLE_BASE_URL=http://localhost:8081
 export SALESFORCE_BASE_URL=http://localhost:8082
@@ -100,35 +133,41 @@ export SALESFORCE_BASE_URL=http://localhost:8082
 uvicorn app.asgi:app --reload --port 8090
 ```
 
-Then point the orchestrator (wherever it's running) at `GATEWAY_MCP_URL=http://localhost:8090/mcp`.
+Verify: `curl http://localhost:8090/health` → `{"status": "ok"}`. For a deeper check that the actual MCP protocol surface works (`tools/list`/`tools/call`), run `python scripts/mcp_smoke_test.py` once this and step 1's seed data are both up.
 
-### A mock (Bluemarble or Salesforce)
+### 5. `orchestrator` — LangGraph agents, `/chat` and `/approve/{id}` (port 8000)
 
-Same shape — only Postgres is a dependency:
+Depends on: `gateway-mcp` (step 4). This is where the router and the three agent nodes (`app/agents/*.py`) live — the one you'll touch most.
 
 ```bash
-docker compose up -d db
-
-cd services/mock-bluemarble   # or mock-salesforce
+cd services/orchestrator
 python -m venv .venv && . .venv/Scripts/activate
 pip install -r requirements.txt
 
-export POSTGRES_USER=vz_poc POSTGRES_PASSWORD=change-me-locally POSTGRES_DB=vz_poc
-export POSTGRES_HOST=localhost POSTGRES_PORT=5432
+export GATEWAY_MCP_URL=http://localhost:8090/mcp
+export GATEWAY_API_KEY=dev-gateway-key-change-me   # same value as step 4
+export AWS_REGION=eu-west-1
+export BEDROCK_MODEL_ID=anthropic.claude-3-5-sonnet-20241022-v2:0
+# AWS credentials: exported env vars (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_SESSION_TOKEN),
+# or your default ~/.aws profile — boto3's normal credential chain. Required for any actual chat reply.
 
-uvicorn app.main:app --reload --port 8081   # 8082 for mock-salesforce
+uvicorn app.api:app --reload --port 8000
 ```
 
-### UI
+Verify: `curl http://localhost:8000/health` → `{"status": "ok"}`. To confirm the whole chain including Bedrock, run one of the `scripts/golden_path_test.py --branch ...` commands from §1.
 
-The UI is static files with no build step — `chat.js` defaults `ORCHESTRATOR_BASE_URL` to `http://localhost:8000`, so as long as the orchestrator is reachable there, you can just open [`services/ui/index.html`](../services/ui/index.html) directly in a browser, or serve the folder with anything static:
+### 6. `ui` — static chat UI (port 8080)
+
+Depends on: `orchestrator` (step 5). No build step — plain HTML/CSS/JS.
 
 ```bash
 cd services/ui
 python -m http.server 8080
 ```
 
-To point it at a non-default orchestrator URL, set `window.ORCHESTRATOR_BASE_URL` before `chat.js` loads (e.g. add a small inline `<script>` in `index.html`).
+`chat.js` defaults `ORCHESTRATOR_BASE_URL` to `http://localhost:8000`, so this works as-is once step 5 is up. To point it at a non-default orchestrator URL, set `window.ORCHESTRATOR_BASE_URL` before `chat.js` loads (e.g. a small inline `<script>` in `index.html`).
+
+Open **http://localhost:8080** and verify the chat responds.
 
 ## 4. Troubleshooting
 
