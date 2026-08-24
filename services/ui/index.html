@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>VodafoneZiggo Assistant (POC)</title>
+<link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="app">
+    <header>
+      <h1>VodafoneZiggo Conversational AI — POC</h1>
+      <span class="phase-badge" id="phase-badge">advise</span>
+    </header>
+
+    <div class="chat" id="chat"></div>
+
+    <div class="proposal-card hidden" id="proposal-card">
+      <h3 id="proposal-title"></h3>
+      <p id="proposal-detail"></p>
+      <label class="fail-toggle">
+        <input type="checkbox" id="simulate-failure" />
+        Simulate CRM sync failure (compensation demo)
+      </label>
+      <button id="approve-btn">Approve</button>
+    </div>
+
+    <form class="composer" id="composer">
+      <input type="text" id="message-input" placeholder="Ask about your usage, or ask to upgrade your plan…" autocomplete="off" />
+      <button type="submit">Send</button>
+    </form>
+  </div>
+
+  <!-- AWS phase: CDK's ui_stack should inject the deployed orchestrator ALB
+       URL here, e.g. <script>window.ORCHESTRATOR_BASE_URL = "https://...";</script>
+       Defaults to http://localhost:8000 for local docker-compose. -->
+  <script src="chat.js"></script>
+</body>
+</html>

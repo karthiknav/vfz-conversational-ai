@@ -1,0 +1,99 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    ports:
+      - "5432:5432"
+    volumes:
+      - db-data:/var/lib/postgresql/data
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  mock-bluemarble:
+    build: ./services/mock-bluemarble
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_HOST: db
+      POSTGRES_PORT: "5432"
+    ports:
+      - "8081:8081"
+    depends_on:
+      db:
+        condition: service_healthy
+
+  mock-salesforce:
+    build: ./services/mock-salesforce
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_HOST: db
+      POSTGRES_PORT: "5432"
+    ports:
+      - "8082:8082"
+    depends_on:
+      db:
+        condition: service_healthy
+
+  gateway-mcp:
+    build: ./services/gateway-mcp
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_HOST: db
+      POSTGRES_PORT: "5432"
+      GATEWAY_API_KEY: ${GATEWAY_API_KEY}
+      GATEWAY_RATE_LIMIT_PER_MIN: ${GATEWAY_RATE_LIMIT_PER_MIN}
+      BLUEMARBLE_BASE_URL: http://mock-bluemarble:8081
+      SALESFORCE_BASE_URL: http://mock-salesforce:8082
+    ports:
+      - "8090:8090"
+    depends_on:
+      db:
+        condition: service_healthy
+      mock-bluemarble:
+        condition: service_healthy
+      mock-salesforce:
+        condition: service_healthy
+
+  orchestrator:
+    build: ./services/orchestrator
+    environment:
+      GATEWAY_MCP_URL: http://gateway-mcp:8090/mcp
+      GATEWAY_API_KEY: ${GATEWAY_API_KEY}
+      AWS_REGION: ${AWS_REGION}
+      BEDROCK_MODEL_ID: ${BEDROCK_MODEL_ID}
+      BEDROCK_GUARDRAIL_ID: ${BEDROCK_GUARDRAIL_ID}
+      BEDROCK_GUARDRAIL_VERSION: ${BEDROCK_GUARDRAIL_VERSION}
+      LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY}
+      LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY}
+      LANGFUSE_HOST: ${LANGFUSE_HOST}
+      GOVERNANCE_AUTO_APPROVE_DELTA_EUR: ${GOVERNANCE_AUTO_APPROVE_DELTA_EUR}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      AWS_SESSION_TOKEN: ${AWS_SESSION_TOKEN:-}
+    ports:
+      - "8000:8000"
+    depends_on:
+      gateway-mcp:
+        condition: service_healthy
+
+  ui:
+    build: ./services/ui
+    ports:
+      - "8080:80"
+    depends_on:
+      - orchestrator
+
+volumes:
+  db-data:

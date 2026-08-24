@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(xargs -0 -n1 python -m py_compile)",
+      "Bash(docker --version)",
+      "Bash(docker compose *)",
+      "Bash(docker info *)"
+    ]
+  }
+}
