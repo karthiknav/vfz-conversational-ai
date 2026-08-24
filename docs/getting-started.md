@@ -76,6 +76,14 @@ Verify:
 docker compose ps db          # should show "healthy"
 ```
 
+**Test locally** — connect with `psql` and confirm the seed data actually landed (not just that the process is up):
+```bash
+docker compose exec db psql -U vz_poc -d vz_poc -c "\dn"                                          # schemas: bluemarble, salesforce, analytics, audit
+docker compose exec db psql -U vz_poc -d vz_poc -c "SELECT id, monthly_price FROM bluemarble.product_offering;"  # OFFER-20GB / OFFER-50GB / OFFER-UNLIMITED
+docker compose exec db psql -U vz_poc -d vz_poc -c "SELECT customer_id, name FROM analytics.customer_360;"       # CUST-1001 | Anna de Groot
+```
+Same check, scripted: `python scripts/seed_db.py --check`. If any of this comes back empty, the init scripts under `db/init/` didn't run — see [Troubleshooting](#4-troubleshooting).
+
 ### 2. `mock-bluemarble` — catalog + order management mock (port 8081)
 
 Depends on: `db`.
@@ -92,6 +100,15 @@ uvicorn app.main:app --reload --port 8081
 ```
 
 Verify: `curl http://localhost:8081/health` → `{"status": "ok"}`.
+
+**Test locally** — exercise the actual TM Forum-shaped endpoints, not just health:
+```bash
+curl http://localhost:8081/catalog                                              # returns the 3 seeded product offerings
+curl -X POST http://localhost:8081/productOrderingManagement/v4/productOrder \
+  -H "Content-Type: application/json" \
+  -d '{"customer_id": "CUST-1001", "product_offering_id": "OFFER-50GB"}'        # 201, returns the new order incl. its id
+curl http://localhost:8081/productOrderingManagement/v4/productOrder/<id-from-above>   # should echo the same order back
+```
 
 (Or skip the venv and just run it in Docker: `docker compose up -d mock-bluemarble`.)
 
@@ -111,6 +128,15 @@ uvicorn app.main:app --reload --port 8082
 ```
 
 Verify: `curl http://localhost:8082/health` → `{"status": "ok"}`.
+
+**Test locally** — create a case and read it back:
+```bash
+curl -X POST http://localhost:8082/Case \
+  -H "Content-Type: application/json" \
+  -d '{"customer_id": "CUST-1001", "subject": "Local smoke test", "reason": "testing"}'   # 201, returns CASE-<n>
+curl http://localhost:8082/Case/<id-from-above>                                          # should echo the same case back
+```
+Set `"force_fail": true` in the POST body to exercise the induced-failure path the orchestrator's compensation logic handles (see [`demo-script.md`](demo-script.md)) — it returns a `500` instead of creating the case.
 
 (Or: `docker compose up -d mock-salesforce`.)
 
@@ -133,7 +159,18 @@ export SALESFORCE_BASE_URL=http://localhost:8082
 uvicorn app.asgi:app --reload --port 8090
 ```
 
-Verify: `curl http://localhost:8090/health` → `{"status": "ok"}`. For a deeper check that the actual MCP protocol surface works (`tools/list`/`tools/call`), run `python scripts/mcp_smoke_test.py` once this and step 1's seed data are both up.
+Verify: `curl http://localhost:8090/health` → `{"status": "ok"}`.
+
+**Test locally:**
+```bash
+curl -X POST http://localhost:8090/mcp                                          # no api key → 401 (auth middleware is doing its job)
+curl -X POST http://localhost:8090/mcp -H "x-api-key: dev-gateway-key-change-me"  # authenticated, but not a real MCP request → still tells you auth passed
+```
+For a real check of the MCP protocol surface (`tools/list`/`tools/call` over streamable HTTP — not something plain `curl` can drive), run:
+```bash
+python scripts/mcp_smoke_test.py
+```
+once this and step 1's seed data are both up. It confirms all 7 tools are discoverable, unauthenticated calls are rejected, and one authenticated `get_catalog` round-trip works end to end.
 
 ### 5. `orchestrator` — LangGraph agents, `/chat` and `/approve/{id}` (port 8000)
 
@@ -154,7 +191,15 @@ export BEDROCK_MODEL_ID=anthropic.claude-3-5-sonnet-20241022-v2:0
 uvicorn app.api:app --reload --port 8000
 ```
 
-Verify: `curl http://localhost:8000/health` → `{"status": "ok"}`. To confirm the whole chain including Bedrock, run one of the `scripts/golden_path_test.py --branch ...` commands from §1.
+Verify: `curl http://localhost:8000/health` → `{"status": "ok"}`.
+
+**Test locally** — send an actual chat turn (requires working AWS Bedrock creds; use the seeded `CUST-1001`):
+```bash
+curl -X POST http://localhost:8000/chat \
+  -H "Content-Type: application/json" \
+  -d '{"customer_id": "CUST-1001", "thread_id": "local-test-1", "message": "How much data have I used this month?"}'
+```
+A working reply means the full chain — orchestrator → gateway-mcp (auth'd) → mock-bluemarble → Postgres → Bedrock — is wired correctly. To confirm the branching logic too (auto-approve / escalation / partial-failure + compensation), run one of the `scripts/golden_path_test.py --branch ...` commands from §1.
 
 ### 6. `ui` — static chat UI (port 8080)
 
@@ -168,6 +213,8 @@ python -m http.server 8080
 `chat.js` defaults `ORCHESTRATOR_BASE_URL` to `http://localhost:8000`, so this works as-is once step 5 is up. To point it at a non-default orchestrator URL, set `window.ORCHESTRATOR_BASE_URL` before `chat.js` loads (e.g. a small inline `<script>` in `index.html`).
 
 Open **http://localhost:8080** and verify the chat responds.
+
+**Test locally** — no separate API test needed here since it's a static frontend; the real test is exercising it in a browser: open dev tools' Network tab, send a message, and confirm a `POST /chat` fires against `http://localhost:8000` and renders the reply. A blank/erroring UI with a healthy `orchestrator` from step 5 is almost always the CORS issue noted below, not a UI bug.
 
 ## 4. Troubleshooting
 
