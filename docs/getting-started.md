@@ -25,7 +25,7 @@ db  →  mock-bluemarble, mock-salesforce  →  gateway-mcp  →  orchestrator  
 Once containers report healthy, verify the seed data and MCP surface from the host. These `scripts/` helpers get their own venv at the repo root, kept separate from any service's venv and from system Python:
 
 ```bash
-python -m venv .venv && . .venv/Scripts/activate   # macOS/Linux: source .venv/bin/activate
+python -m venv .venv && source .venv/Scripts/activate   # Windows (Git Bash). macOS/Linux: source .venv/bin/activate
 pip install -r scripts/requirements.txt
 python scripts/seed_db.py --check         # confirms seed data landed in Postgres
 python scripts/mcp_smoke_test.py          # confirms the Gateway's MCP server answers tools/list + tools/call
@@ -61,7 +61,7 @@ Every Python service is `FROM python:3.12-slim`, installs its own `requirements.
 
 This is the full manual walkthrough — bring each service up standalone, in dependency order, verifying each with a health check before starting the next. Useful when you're actively developing one service and want `--reload` on it, or just want to understand the stack piece by piece. If you just want everything running, use §1 instead.
 
-Every step assumes you're at the repo root unless a step says `cd`. Commands below are written for bash (Git Bash on Windows, or a regular shell on macOS/Linux) — each venv activation line calls out the macOS/Linux path inline. If you're on Windows PowerShell instead, replace `export VAR=value` with `$env:VAR = "value"` and `. .venv/Scripts/activate` with `.venv\Scripts\Activate.ps1`.
+Every step assumes you're at the repo root unless a step says `cd`. Commands below are written for bash (Git Bash on Windows, or a regular shell on macOS/Linux) — each venv activation line calls out both paths inline (Windows venvs put the activate script under `Scripts/`, not `bin/`). If you're on Windows PowerShell instead, replace `export VAR=value` with `$env:VAR = "value"` and `source .venv/Scripts/activate` with `.venv\Scripts\Activate.ps1`.
 
 Each service that has its own `requirements.txt` (`mock-bluemarble`, `mock-salesforce`, `gateway-mcp`, `orchestrator`) gets its **own** `.venv` inside that service's directory — their dependency sets diverge (e.g. `orchestrator` pulls in `langgraph`/`boto3`, the mocks don't), so a shared venv isn't safe to reuse across them. `ui` has no `requirements.txt` and needs no venv at all — it's served with the plain system `python -m http.server`.
 
@@ -93,7 +93,7 @@ Depends on: `db`.
 
 ```bash
 cd services/mock-bluemarble
-python -m venv .venv && . .venv/Scripts/activate   # macOS/Linux: source .venv/bin/activate
+python -m venv .venv && source .venv/Scripts/activate   # Windows (Git Bash). macOS/Linux: source .venv/bin/activate
 pip install -r requirements.txt
 
 export POSTGRES_USER=vz_poc POSTGRES_PASSWORD=change-me-locally POSTGRES_DB=vz_poc
@@ -121,7 +121,7 @@ Depends on: `db`. Same shape as step 2:
 
 ```bash
 cd services/mock-salesforce
-python -m venv .venv && . .venv/Scripts/activate   # macOS/Linux: source .venv/bin/activate
+python -m venv .venv && source .venv/Scripts/activate   # Windows (Git Bash). macOS/Linux: source .venv/bin/activate
 pip install -r requirements.txt
 
 export POSTGRES_USER=vz_poc POSTGRES_PASSWORD=change-me-locally POSTGRES_DB=vz_poc
@@ -149,7 +149,7 @@ Depends on: `db`, `mock-bluemarble`, `mock-salesforce` (steps 1–3 must be reac
 
 ```bash
 cd services/gateway-mcp
-python -m venv .venv && . .venv/Scripts/activate   # macOS/Linux: source .venv/bin/activate
+python -m venv .venv && source .venv/Scripts/activate   # Windows (Git Bash). macOS/Linux: source .venv/bin/activate
 pip install -r requirements.txt
 
 export POSTGRES_USER=vz_poc POSTGRES_PASSWORD=change-me-locally POSTGRES_DB=vz_poc
@@ -181,7 +181,7 @@ Depends on: `gateway-mcp` (step 4). This is where the router and the three agent
 
 ```bash
 cd services/orchestrator
-python -m venv .venv && . .venv/Scripts/activate   # macOS/Linux: source .venv/bin/activate
+python -m venv .venv && source .venv/Scripts/activate   # Windows (Git Bash). macOS/Linux: source .venv/bin/activate
 pip install -r requirements.txt
 
 export GATEWAY_MCP_URL=http://localhost:8090/mcp

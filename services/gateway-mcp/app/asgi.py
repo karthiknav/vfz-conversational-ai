@@ -23,7 +23,7 @@ mcp_app = mcp.streamable_http_app()
 async def lifespan(app: FastAPI):
     async with AsyncExitStack() as stack:
         await get_pool()
-        await stack.enter_async_context(mcp_app.lifespan(app))
+        await stack.enter_async_context(mcp.session_manager.run())
         yield
     await close_pool()
     await close_clients()

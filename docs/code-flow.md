@@ -111,7 +111,20 @@ ASGI (Asynchronous Server Gateway Interface) is Python's standard contract betwe
 
 Rough equivalent for anyone coming from Java: Uvicorn plays the role Tomcat plays for servlets — it binds the socket, speaks HTTP, and dispatches each request into your app via a standard interface. The differences are that Uvicorn is deliberately thin (single async event loop, no bundled sessions/JSP/multi-app hosting — one ASGI app per process, usually run under several Uvicorn/Gunicorn worker processes) where Tomcat is a heavier container with more built in.
 
-The MCP Python SDK's `FastMCP` object already produces its own ASGI app via `mcp.streamable_http_app()` — that alone could run standalone. This project instead wraps it inside a second, ordinary FastAPI app and mounts it as a sub-app:
+For anyone coming from Spring Boot specifically, the mapping is closer to home (Spring Boot already bundles the container the way this project does):
+
+| Spring Boot | Here | What it is |
+|---|---|---|
+| Embedded Tomcat/Netty | Uvicorn | The process binding the port and speaking HTTP |
+| The Servlet API contract (what `DispatcherServlet` implements) | The ASGI interface (`async def __call__(scope, receive, send)`) | The standard shape a container knows how to call into |
+| `@SpringBootApplication` class / the `ApplicationContext` | `app = FastAPI(...)` | The object that *is* your application — the container holds a reference to it and forwards every request to it |
+| `@RestController` methods (`@GetMapping`, `@PostMapping`) | `@app.get(...)`, `@app.post(...)` | Route handlers |
+| `javax.servlet.Filter` / `OncePerRequestFilter`, registered in a chain | `app.add_middleware(RateLimitMiddleware)`, `app.add_middleware(APIKeyAuthMiddleware)` | Cross-cutting logic wrapping every request before it reaches a handler — auth, rate limiting |
+| `ServletRegistrationBean` registering a second, self-contained servlet at a sub-path inside the same app (how Actuator or a bundled Swagger-UI servlet gets mounted at `/actuator`) | `app.router.routes.append(Mount("/mcp", app=mcp_app))` | Nesting a whole second app under a URL prefix, inside the same process |
+
+`mock-bluemarble` and `mock-salesforce` are the boring, familiar case in this vocabulary: one `@SpringBootApplication`-equivalent (`app = FastAPI(...)` in their `app/main.py`), a handful of `@RestController`-equivalent routes, no filters, no nested servlet. `gateway-mcp` is the app that adds both a filter chain and a `ServletRegistrationBean`-style nested sub-app — see below.
+
+The MCP Python SDK's `FastMCP` object already produces its own ASGI app via `mcp.streamable_http_app()` — that alone could run standalone, the way Actuator's request handling *could* be its own deployable. This project instead wraps it inside a second, ordinary FastAPI app and mounts it as a sub-app, the same way `ServletRegistrationBean` bolts a self-contained servlet onto an existing app at a path rather than running it separately:
 
 ```python
 # asgi.py
