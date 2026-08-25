@@ -22,17 +22,18 @@ This starts, in dependency order (`depends_on` + healthchecks in `docker-compose
 db  →  mock-bluemarble, mock-salesforce  →  gateway-mcp  →  orchestrator  →  ui
 ```
 
-Once containers report healthy, verify the seed data and MCP surface from the host:
+Once containers report healthy, verify the seed data and MCP surface from the host. These `scripts/` helpers get their own venv at the repo root, kept separate from any service's venv and from system Python:
 
 ```bash
-python -m pip install -r scripts/requirements.txt
+python -m venv .venv && . .venv/Scripts/activate   # macOS/Linux: source .venv/bin/activate
+pip install -r scripts/requirements.txt
 python scripts/seed_db.py --check         # confirms seed data landed in Postgres
 python scripts/mcp_smoke_test.py          # confirms the Gateway's MCP server answers tools/list + tools/call
 ```
 
 Then either:
 - Open **http://localhost:8080** for the chat UI, or
-- Drive the API directly:
+- Drive the API directly (same `.venv`, activate it again if you're in a new shell):
   ```bash
   python scripts/golden_path_test.py --branch auto_approve
   python scripts/golden_path_test.py --branch escalate
@@ -47,7 +48,7 @@ To stop everything: `docker compose down` (add `-v` to also drop the Postgres vo
 
 | Service | Port | Health check | Depends on |
 |---|---|---|---|
-| `db` (Postgres) | 5432 | `pg_isready` | — |
+| `db` (Postgres) | 5433 (host) → 5432 (container) | `pg_isready` | — |
 | `mock-bluemarble` | 8081 | `GET /health` | `db` |
 | `mock-salesforce` | 8082 | `GET /health` | `db` |
 | `gateway-mcp` | 8090 | `GET /health` | `db`, `mock-bluemarble`, `mock-salesforce` |
@@ -61,6 +62,8 @@ Every Python service is `FROM python:3.12-slim`, installs its own `requirements.
 This is the full manual walkthrough — bring each service up standalone, in dependency order, verifying each with a health check before starting the next. Useful when you're actively developing one service and want `--reload` on it, or just want to understand the stack piece by piece. If you just want everything running, use §1 instead.
 
 Every step assumes you're at the repo root unless a step says `cd`. On Windows PowerShell, replace `export VAR=value` with `$env:VAR = "value"` and `. .venv/Scripts/activate` for the venv activation (already correct as written below); on macOS/Linux use `source .venv/bin/activate`.
+
+Each service that has its own `requirements.txt` (`mock-bluemarble`, `mock-salesforce`, `gateway-mcp`, `orchestrator`) gets its **own** `.venv` inside that service's directory — their dependency sets diverge (e.g. `orchestrator` pulls in `langgraph`/`boto3`, the mocks don't), so a shared venv isn't safe to reuse across them. `ui` has no `requirements.txt` and needs no venv at all — it's served with the plain system `python -m http.server`.
 
 ### 1. `db` — Postgres
 
@@ -94,7 +97,7 @@ python -m venv .venv && . .venv/Scripts/activate
 pip install -r requirements.txt
 
 export POSTGRES_USER=vz_poc POSTGRES_PASSWORD=change-me-locally POSTGRES_DB=vz_poc
-export POSTGRES_HOST=localhost POSTGRES_PORT=5432   # host, not "db" — you're outside the compose network here
+export POSTGRES_HOST=localhost POSTGRES_PORT=5433   # host, not "db" — you're outside the compose network here (5433, not Postgres's default 5432 — see docker-compose.yml)
 
 uvicorn app.main:app --reload --port 8081
 ```
@@ -122,7 +125,7 @@ python -m venv .venv && . .venv/Scripts/activate
 pip install -r requirements.txt
 
 export POSTGRES_USER=vz_poc POSTGRES_PASSWORD=change-me-locally POSTGRES_DB=vz_poc
-export POSTGRES_HOST=localhost POSTGRES_PORT=5432
+export POSTGRES_HOST=localhost POSTGRES_PORT=5433
 
 uvicorn app.main:app --reload --port 8082
 ```
@@ -150,7 +153,7 @@ python -m venv .venv && . .venv/Scripts/activate
 pip install -r requirements.txt
 
 export POSTGRES_USER=vz_poc POSTGRES_PASSWORD=change-me-locally POSTGRES_DB=vz_poc
-export POSTGRES_HOST=localhost POSTGRES_PORT=5432
+export POSTGRES_HOST=localhost POSTGRES_PORT=5433
 export GATEWAY_API_KEY=dev-gateway-key-change-me   # must match what you'll export for orchestrator in step 5
 export GATEWAY_RATE_LIMIT_PER_MIN=60
 export BLUEMARBLE_BASE_URL=http://localhost:8081
@@ -218,6 +221,7 @@ Open **http://localhost:8080** and verify the chat responds.
 
 ## 4. Troubleshooting
 
+- **Postgres port 5432 already in use / auth fails against the Docker `db` even with the right password** — usually a native Postgres install on the host (common on Windows/Mac dev machines) already bound to 5432, silently answering instead of the container. `docker-compose.yml` maps the `db` service to **host port 5433** (container-internal port stays the standard 5432) specifically to avoid this collision. Any *host*-side connection — `psql -h localhost`, pgAdmin, or a service run standalone outside Docker (§3) — must use port **5433**, not 5432. Containers talking to each other over the Compose network (`POSTGRES_HOST=db`) are unaffected; they always use 5432 internally.
 - **`KeyError: 'GATEWAY_API_KEY'` on startup** — both `gateway-mcp` and `orchestrator` read this with `os.environ[...]` (no default, since it's a credential). Make sure it's exported in whichever shell/`.env` is feeding that process, and that both services use the *same* value.
 - **Chat replies are empty/error out, everything else works** — almost always missing or invalid AWS Bedrock credentials/region, or no model access granted for `BEDROCK_MODEL_ID` in that account/region. Health checks and DB-backed routes don't need AWS at all, so they'll look fine even when this is broken.
 - **UI shows a network error calling `/chat` when `ui` and `orchestrator` run in separate containers on different ports** — there's no CORS middleware on the orchestrator today, so a browser can block the cross-origin POST from `localhost:8080` to `localhost:8000` depending on browser/version. If you hit this, either serve the UI as a plain local file (`file://` origin issues aside, `python -m http.server` from `services/ui` works around it in practice) or add `fastapi.middleware.cors.CORSMiddleware` to `api.py` for local dev.
