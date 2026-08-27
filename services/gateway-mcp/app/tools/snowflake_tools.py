@@ -4,6 +4,8 @@ db/init/004_governed_views.sql; there is no raw-SQL or dynamic-query path
 exposed to an agent anywhere in this module, by design.
 """
 
+from decimal import Decimal
+
 from app.db import get_pool
 from app.middleware.audit_logging import record_audit
 
@@ -94,4 +96,12 @@ async def get_order_eligibility(customer_id: str, thread_id: str) -> dict:
 def _jsonable(row: dict | None) -> dict | None:
     if row is None:
         return None
-    return {k: (v.isoformat() if hasattr(v, "isoformat") else v) for k, v in row.items()}
+    return {k: _jsonable_value(v) for k, v in row.items()}
+
+
+def _jsonable_value(v):
+    if isinstance(v, Decimal):
+        return float(v)
+    if hasattr(v, "isoformat"):
+        return v.isoformat()
+    return v
