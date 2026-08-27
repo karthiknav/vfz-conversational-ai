@@ -186,8 +186,8 @@ pip install -r requirements.txt
 
 export GATEWAY_MCP_URL=http://localhost:8090/mcp
 export GATEWAY_API_KEY=dev-gateway-key-change-me   # same value as step 4
-export AWS_REGION=eu-west-1
-export BEDROCK_MODEL_ID=anthropic.claude-3-5-sonnet-20241022-v2:0
+export AWS_REGION=us-east-1
+export BEDROCK_MODEL_ID=anthropic.claude-sonnet-4-6
 # AWS credentials: exported env vars (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_SESSION_TOKEN),
 # or your default ~/.aws profile — boto3's normal credential chain. Required for any actual chat reply.
 
