@@ -291,10 +291,13 @@ through the NAT Gateway to the public internet):
   no need for this endpoint and doesn't get one — defense in depth mirrored
   by network placement, not just IAM.
 - `SecretsManagerEndpoint` (`com.amazonaws.<region>.secretsmanager`) —
-  placed in **all four** private subnets (eks-private and gateway-private),
-  because both platforms read secrets: the orchestrator reads DB
-  credentials, the gateway API key, and Langfuse keys; gateway-mcp and the
-  mocks read DB credentials and the gateway API key.
+  placed in the **eks-private** subnets, one ENI per AZ (an interface
+  endpoint can only have one ENI per AZ, and EksPrivateSubnet1/2 and
+  GatewayPrivateSubnet1/2 pair up by AZ). Both platforms read secrets from
+  it — the orchestrator reads DB credentials, the gateway API key, and
+  Langfuse keys; gateway-mcp and the mocks read DB credentials and the
+  gateway API key — gateway-private traffic reaches these ENIs over the
+  VPC's implicit local route, no ENI of its own needed.
 
 Both endpoints have `PrivateDnsEnabled: true`, so in-VPC callers resolve
 the normal `secretsmanager.<region>.amazonaws.com` / `bedrock-runtime.<region>.amazonaws.com`

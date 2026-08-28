@@ -225,7 +225,10 @@ Resources:
       ServiceName: !Sub "com.amazonaws.${AWS::Region}.secretsmanager"
       VpcEndpointType: Interface
       PrivateDnsEnabled: true
-      SubnetIds: [!Ref EksPrivateSubnet1, !Ref EksPrivateSubnet2, !Ref GatewayPrivateSubnet1, !Ref GatewayPrivateSubnet2]
+      # One ENI per AZ, not per subnet - EksPrivateSubnet1/2 and
+      # GatewayPrivateSubnet1/2 pair up by AZ, and gateway-private traffic
+      # reaches these ENIs fine over the VPC's implicit local route.
+      SubnetIds: [!Ref EksPrivateSubnet1, !Ref EksPrivateSubnet2]
       SecurityGroupIds: [!Ref VpcEndpointSg]
 
 Outputs:
