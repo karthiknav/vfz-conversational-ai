@@ -204,6 +204,43 @@ curl -X POST http://localhost:8000/chat \
 ```
 A working reply means the full chain — orchestrator → gateway-mcp (auth'd) → mock-bluemarble → Postgres → Bedrock — is wired correctly. To confirm the branching logic too (auto-approve / escalation / partial-failure + compensation), run one of the `scripts/golden_path_test.py --branch ...` commands from §1.
 
+**Invoking Bluemarble specifically** — the example above only reaches `snowflake_tools` (the read-only usage lookup). To exercise the Bluemarble path (`get_catalog` + `propose_order` in `bluemarble_tools.py`, bound to the `transactional_agent`), ask for an upgrade instead:
+
+```bash
+curl -X POST http://localhost:8000/chat \
+  -H "Content-Type: application/json" \
+  -d '{"customer_id": "CUST-1001", "thread_id": "local-test-2", "message": "I am close to my limit, can I upgrade to 50GB?"}'
+```
+
+The router sends this to the `transactional_agent`, which calls `get_catalog` (lists offerings from `mock-bluemarble`) then `propose_order` (reads current spend from Postgres, computes the price delta — reads only, writes nothing). The response's `pending_proposal` carries a `proposal_id` (e.g. `PROP-A1B2C3`) and `phase` switches to `configure`:
+
+```json
+{
+  "thread_id": "local-test-2",
+  "phase": "configure",
+  "reply": "...",
+  "pending_proposal": {
+    "proposal_id": "PROP-A1B2C3",
+    "customer_id": "CUST-1001",
+    "target_offer_id": "OFFER-50GB",
+    "target_offer_name": "Ziggo Mobile M",
+    "target_monthly_price_eur": 44.99,
+    "current_monthly_price_eur": 34.99,
+    "delta_eur": 10.0
+  }
+}
+```
+
+Approve it to hit `submit_order` — the one write path in `bluemarble_tools.py`, bound to the `governance_agent` node, which independently re-checks eligibility and the auto-approve threshold before writing anything:
+
+```bash
+curl -X POST http://localhost:8000/approve/PROP-A1B2C3 \
+  -H "Content-Type: application/json" \
+  -d '{"thread_id": "local-test-2", "customer_id": "CUST-1001"}'
+```
+
+A €10.00 delta is under the default `GOVERNANCE_AUTO_APPROVE_DELTA_EUR` (€15.00), so this auto-approves and creates a real order in `mock-bluemarble` — confirm with `curl http://localhost:8081/productOrderingManagement/v4/productOrder/<order-id>` (id comes back in the `/approve` response's `result.order.id`). See [`demo-script.md`](demo-script.md) for the escalation and partial-failure branches.
+
 ### 6. `ui` — static chat UI (port 8080)
 
 Depends on: `orchestrator` (step 5). No build step — plain HTML/CSS/JS.
