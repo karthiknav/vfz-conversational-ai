@@ -21,6 +21,7 @@ original sketch in docs/architecture-decisions.md:
    still open — the plan's "what's my usage" example.
 """
 
+import os
 from typing import Literal
 
 from langchain_core.messages import AIMessage, SystemMessage
@@ -34,6 +35,8 @@ from app.state import JourneyState
 
 
 class RouterDecision(BaseModel):
+    """Routing decision for a customer message: which internal agent should handle it."""
+
     intent: Literal["knowledge", "transactional", "out_of_scope"]
 
 
@@ -95,17 +98,43 @@ def build_graph(checkpointer) -> StateGraph:
     return graph.compile(checkpointer=checkpointer)
 
 
+def _postgres_conninfo() -> str | None:
+    host = os.environ.get("POSTGRES_HOST")
+    if not host:
+        return None
+    port = os.environ.get("POSTGRES_PORT", "5432")
+    db = os.environ.get("POSTGRES_DB", "vfz_poc")
+    user = os.environ["POSTGRES_USER"]
+    password = os.environ["POSTGRES_PASSWORD"]
+    return f"postgresql://{user}:{password}@{host}:{port}/{db}"
+
+
+_checkpointer_cm = None
 _checkpointer = None
 _compiled_graph = None
 
 
 async def get_graph():
-    """Local: MemorySaver (in-process, lost on restart). AWS phase: swap for
-    langgraph.checkpoint.postgres.aio.AsyncPostgresSaver against the same
-    Aurora cluster the mocks use — this is the only line that changes.
+    """Local (no POSTGRES_HOST): MemorySaver, in-process, lost on restart.
+    AWS (POSTGRES_HOST set, per infra/k8s/orchestrator/deployment.yaml):
+    AsyncPostgresSaver against the shared RDS instance — required once the
+    orchestrator runs with replicas > 1, since conversation/proposal state
+    (the /approve hand-off) must survive pod restarts and be visible across
+    replicas, not just the process that handled the /chat turn.
     """
-    global _checkpointer, _compiled_graph
-    if _compiled_graph is None:
+    global _checkpointer_cm, _checkpointer, _compiled_graph
+    if _compiled_graph is not None:
+        return _compiled_graph
+
+    conninfo = _postgres_conninfo()
+    if conninfo is None:
         _checkpointer = MemorySaver()
-        _compiled_graph = build_graph(_checkpointer)
+    else:
+        from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+
+        _checkpointer_cm = AsyncPostgresSaver.from_conn_string(conninfo)
+        _checkpointer = await _checkpointer_cm.__aenter__()
+        await _checkpointer.setup()
+
+    _compiled_graph = build_graph(_checkpointer)
     return _compiled_graph
