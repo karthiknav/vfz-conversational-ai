@@ -5,7 +5,7 @@ Ten independent stacks, wired together via `Fn::ImportValue`. Each stack's
 all stacks in one environment, since several templates default their
 cross-stack `*StackName` parameters assuming CloudFormation stack names of
 the form `vfz-<concern>` (e.g. `vfz-network`, `vfz-data`). Region: pick one
-with Bedrock model access (the app defaults to `eu-west-1`). The commands
+with Bedrock model access (the app defaults to `us-east-1`). The commands
 below all assume that region and the default stack names — adjust both
 consistently if you deploy elsewhere.
 
@@ -47,7 +47,7 @@ aws cloudformation deploy \
   --stack-name vfz-network \
   --template-file network.yaml \
   --parameter-overrides EnvironmentName=vfz-poc \
-  --region eu-west-1
+  --region us-east-1
 ```
 
 ### 2. eks-cluster (parallel with gateway-ecs-cluster)
@@ -61,7 +61,7 @@ aws cloudformation deploy \
   --template-file eks-cluster.yaml \
   --parameter-overrides EnvironmentName=vfz-poc NetworkStackName=vfz-network \
   --capabilities CAPABILITY_NAMED_IAM \
-  --region eu-west-1
+  --region us-east-1
 ```
 
 ### 3. gateway-ecs-cluster (parallel with eks-cluster)
@@ -74,7 +74,7 @@ aws cloudformation deploy \
   --stack-name vfz-gateway-ecs-cluster \
   --template-file gateway-ecs-cluster.yaml \
   --parameter-overrides EnvironmentName=vfz-poc \
-  --region eu-west-1
+  --region us-east-1
 ```
 
 ### 4. eks-nodegroup, data, ecr, app-secrets (parallel)
@@ -89,34 +89,34 @@ aws cloudformation deploy \
   --template-file eks-nodegroup.yaml \
   --parameter-overrides EnvironmentName=vfz-poc NetworkStackName=vfz-network EksClusterStackName=vfz-eks-cluster \
   --capabilities CAPABILITY_NAMED_IAM \
-  --region eu-west-1
+  --region us-east-1
 
 # data — depends on network + eks-cluster (for the EKS-side DB ingress rule)
 aws cloudformation deploy \
   --stack-name vfz-data \
   --template-file data.yaml \
   --parameter-overrides EnvironmentName=vfz-poc NetworkStackName=vfz-network EksClusterStackName=vfz-eks-cluster \
-  --region eu-west-1
+  --region us-east-1
 
 # ecr — no dependencies
 aws cloudformation deploy \
   --stack-name vfz-ecr \
   --template-file ecr.yaml \
   --parameter-overrides EnvironmentName=vfz-poc \
-  --region eu-west-1
+  --region us-east-1
 
 # app-secrets — no dependencies
 aws cloudformation deploy \
   --stack-name vfz-app-secrets \
   --template-file app-secrets.yaml \
   --parameter-overrides EnvironmentName=vfz-poc \
-  --region eu-west-1
+  --region us-east-1
 ```
 
 Once `ecr` exists, build and push all four images before continuing:
 
 ```bash
-aws ecr get-login-password --region eu-west-1 | docker login --username AWS --password-stdin <account>.dkr.ecr.eu-west-1.amazonaws.com
+aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin <account>.dkr.ecr.us-east-1.amazonaws.com
 
 docker build -t <orchestrator-repo-uri>:latest services/orchestrator && docker push <orchestrator-repo-uri>:latest
 docker build -t <gateway-mcp-repo-uri>:latest services/gateway-mcp && docker push <gateway-mcp-repo-uri>:latest
@@ -143,7 +143,7 @@ aws cloudformation deploy \
     DataStackName=vfz-data \
     AppSecretsStackName=vfz-app-secrets \
   --capabilities CAPABILITY_NAMED_IAM \
-  --region eu-west-1
+  --region us-east-1
 ```
 
 This publishes `GATEWAY_MCP_URL` as an SSM parameter (`GatewayMcpUrl` /
@@ -174,7 +174,7 @@ aws cloudformation deploy \
     BedrockModelId=anthropic.claude-3-5-sonnet-20241022-v2:0 \
     BedrockGuardrailId=<guardrail-id-or-leave-blank> \
   --capabilities CAPABILITY_NAMED_IAM \
-  --region eu-west-1
+  --region us-east-1
 ```
 
 ### Cluster bootstrap (Helm, between steps 6 and 7)
@@ -183,7 +183,7 @@ Not CloudFormation — installs cluster add-ons the orchestrator's manifests
 depend on (ALB creation, Secrets Store CSI mounts, HPA metrics):
 
 ```bash
-aws eks update-kubeconfig --name vfz-poc-orchestrator --region eu-west-1
+aws eks update-kubeconfig --name vfz-poc-orchestrator --region us-east-1
 
 helm repo add eks https://aws.github.io/eks-charts && helm repo update
 helm install aws-load-balancer-controller eks/aws-load-balancer-controller \
@@ -208,7 +208,7 @@ from CloudFormation outputs. Simplest approach — `envsubst`:
 
 ```bash
 export ORCHESTRATOR_IRSA_ROLE_ARN=<irsa-roles OrchestratorRoleArn output>
-export AWS_REGION=eu-west-1
+export AWS_REGION=us-east-1
 export ECR_ORCHESTRATOR_IMAGE_URI=<ecr OrchestratorRepoUri output>:latest
 export BEDROCK_GUARDRAIL_ID=<observability guardrail id, or blank>
 export DB_ENDPOINT=<data DbEndpoint output>
@@ -246,7 +246,7 @@ aws cloudformation deploy \
   --stack-name vfz-ui \
   --template-file ui.yaml \
   --parameter-overrides EnvironmentName=vfz-poc \
-  --region eu-west-1
+  --region us-east-1
 
 # then, with services/ui/dist built against the orchestrator's ALB hostname:
 aws s3 sync services/ui/dist s3://<ui UiBucketName output> --delete
