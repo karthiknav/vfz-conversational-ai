@@ -1,0 +1,136 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  IRSA roles for the EKS side: the orchestrator's own pod role (Bedrock +
+  Secrets Manager) and the AWS Load Balancer Controller's role (creates the
+  public ALB in front of the orchestrator from a k8s Ingress). Both trust
+  policies are scoped to the cluster's OIDC provider plus a specific
+  namespace:serviceaccount subject — no other pod in the cluster can assume
+  them.
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: vfz-poc
+  EksClusterStackName:
+    Type: String
+    Default: vfz-eks-cluster
+  AppSecretsStackName:
+    Type: String
+    Default: vfz-app-secrets
+  DataStackName:
+    Type: String
+    Default: vfz-data
+  OrchestratorNamespace:
+    Type: String
+    Default: orchestrator
+  # The AWS Load Balancer Controller's IAM policy is long (~20 statements)
+  # and AWS-maintained — don't hand-copy it into this template. Follow the
+  # official install docs first: download
+  # https://raw.githubusercontent.com/kubernetes-sigs/aws-load-balancer-controller/main/docs/install/iam_policy.json
+  # and `aws iam create-policy --policy-name AWSLoadBalancerControllerIAMPolicy
+  # --policy-document file://iam_policy.json`, then pass the resulting ARN here.
+  LoadBalancerControllerPolicyArn:
+    Type: String
+  BedrockModelId:
+    Type: String
+    Default: anthropic.claude-3-5-sonnet-20241022-v2:0
+  BedrockGuardrailId:
+    Type: String
+    Default: ""
+
+Conditions:
+  HasGuardrail: !Not [!Equals [!Ref BedrockGuardrailId, ""]]
+
+Resources:
+  # AssumeRolePolicyDocument is written as a raw JSON string (not a nested
+  # YAML map) specifically so the OIDC-provider-host-prefixed condition keys
+  # ("<host>:sub", "<host>:aud") can be built with plain string
+  # interpolation — CloudFormation has no clean way to compute a *dynamic map
+  # key* in native YAML/JSON syntax, but Json-typed properties like this one
+  # accept a pre-rendered JSON string just as happily.
+  OrchestratorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${EnvironmentName}-orchestrator-irsa"
+      AssumeRolePolicyDocument: !Sub
+        - |
+          {
+            "Version": "2012-10-17",
+            "Statement": [
+              {
+                "Effect": "Allow",
+                "Principal": { "Federated": "${OidcProviderArn}" },
+                "Action": "sts:AssumeRoleWithWebIdentity",
+                "Condition": {
+                  "StringEquals": {
+                    "${OidcProviderHost}:sub": "system:serviceaccount:${OrchestratorNamespace}:orchestrator",
+                    "${OidcProviderHost}:aud": "sts.amazonaws.com"
+                  }
+                }
+              }
+            ]
+          }
+        - OidcProviderArn: !ImportValue { "Fn::Sub": "${EksClusterStackName}-OidcProviderArn" }
+          OidcProviderHost: !Select [1, !Split ["://", !ImportValue { "Fn::Sub": "${EksClusterStackName}-OidcIssuerUrl" }]]
+      Policies:
+        - PolicyName: BedrockInvoke
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ["bedrock:InvokeModel", "bedrock:InvokeModelWithResponseStream"]
+                Resource: !Sub "arn:aws:bedrock:${AWS::Region}::foundation-model/${BedrockModelId}"
+              - !If
+                - HasGuardrail
+                - Effect: Allow
+                  Action: bedrock:ApplyGuardrail
+                  Resource: !Sub "arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:guardrail/${BedrockGuardrailId}"
+                - !Ref AWS::NoValue
+        - PolicyName: ReadSecrets
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource:
+                  - !ImportValue { "Fn::Sub": "${AppSecretsStackName}-GatewayApiKeySecretArn" }
+                  - !ImportValue { "Fn::Sub": "${AppSecretsStackName}-LangfuseSecretArn" }
+                  - !ImportValue { "Fn::Sub": "${DataStackName}-DbSecretArn" }
+
+  # AWS-published policy for the LB Controller (v2.8+); trimmed to what the
+  # controller actually needs is out of scope for a POC — use the reference
+  # policy verbatim from the aws-load-balancer-controller docs.
+  LoadBalancerControllerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${EnvironmentName}-lb-controller-irsa"
+      AssumeRolePolicyDocument: !Sub
+        - |
+          {
+            "Version": "2012-10-17",
+            "Statement": [
+              {
+                "Effect": "Allow",
+                "Principal": { "Federated": "${OidcProviderArn}" },
+                "Action": "sts:AssumeRoleWithWebIdentity",
+                "Condition": {
+                  "StringEquals": {
+                    "${OidcProviderHost}:sub": "system:serviceaccount:kube-system:aws-load-balancer-controller",
+                    "${OidcProviderHost}:aud": "sts.amazonaws.com"
+                  }
+                }
+              }
+            ]
+          }
+        - OidcProviderArn: !ImportValue { "Fn::Sub": "${EksClusterStackName}-OidcProviderArn" }
+          OidcProviderHost: !Select [1, !Split ["://", !ImportValue { "Fn::Sub": "${EksClusterStackName}-OidcIssuerUrl" }]]
+      ManagedPolicyArns:
+        - !Ref LoadBalancerControllerPolicyArn
+
+Outputs:
+  OrchestratorRoleArn:
+    Value: !GetAtt OrchestratorRole.Arn
+    Export: { Name: !Sub "${AWS::StackName}-OrchestratorRoleArn" }
+  LoadBalancerControllerRoleArn:
+    Value: !GetAtt LoadBalancerControllerRole.Arn
+    Export: { Name: !Sub "${AWS::StackName}-LoadBalancerControllerRoleArn" }

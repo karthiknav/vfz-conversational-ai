@@ -1,0 +1,27 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  A second, independent ECS cluster for gateway-mcp + its two mock backends —
+  deliberately not the EKS cluster, so gateway-mcp is reachable only as an
+  external service the orchestrator calls over HTTPS, not a workload that
+  happens to share a control plane with it.
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: vfz-poc
+
+Resources:
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub "${EnvironmentName}-gateway"
+      ClusterSettings:
+        - { Name: containerInsights, Value: enabled }
+
+Outputs:
+  ClusterName:
+    Value: !Ref Cluster
+    Export: { Name: !Sub "${AWS::StackName}-ClusterName" }
+  ClusterArn:
+    Value: !GetAtt Cluster.Arn
+    Export: { Name: !Sub "${AWS::StackName}-ClusterArn" }

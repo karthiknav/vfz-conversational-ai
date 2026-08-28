@@ -1,0 +1,48 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  ECR repositories for all four service images: orchestrator (EKS) and
+  gateway-mcp/mock-bluemarble/mock-salesforce (gateway ECS cluster).
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: vfz-poc
+
+Resources:
+  OrchestratorRepo:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub "${EnvironmentName}/orchestrator"
+      ImageScanningConfiguration: { ScanOnPush: true }
+      LifecyclePolicy:
+        LifecyclePolicyText: '{"rules":[{"rulePriority":1,"description":"expire untagged images after 14 days","selection":{"tagStatus":"untagged","countType":"sinceImagePushed","countUnit":"days","countNumber":14},"action":{"type":"expire"}}]}'
+
+  GatewayMcpRepo:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub "${EnvironmentName}/gateway-mcp"
+      ImageScanningConfiguration: { ScanOnPush: true }
+      LifecyclePolicy:
+        LifecyclePolicyText: '{"rules":[{"rulePriority":1,"description":"expire untagged images after 14 days","selection":{"tagStatus":"untagged","countType":"sinceImagePushed","countUnit":"days","countNumber":14},"action":{"type":"expire"}}]}'
+
+  MockBluemarbleRepo:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub "${EnvironmentName}/mock-bluemarble"
+      ImageScanningConfiguration: { ScanOnPush: true }
+      LifecyclePolicy:
+        LifecyclePolicyText: '{"rules":[{"rulePriority":1,"description":"expire untagged images after 14 days","selection":{"tagStatus":"untagged","countType":"sinceImagePushed","countUnit":"days","countNumber":14},"action":{"type":"expire"}}]}'
+
+  MockSalesforceRepo:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub "${EnvironmentName}/mock-salesforce"
+      ImageScanningConfiguration: { ScanOnPush: true }
+      LifecyclePolicy:
+        LifecyclePolicyText: '{"rules":[{"rulePriority":1,"description":"expire untagged images after 14 days","selection":{"tagStatus":"untagged","countType":"sinceImagePushed","countUnit":"days","countNumber":14},"action":{"type":"expire"}}]}'
+
+Outputs:
+  OrchestratorRepoUri: { Value: !GetAtt OrchestratorRepo.RepositoryUri, Export: { Name: !Sub "${AWS::StackName}-OrchestratorRepoUri" } }
+  GatewayMcpRepoUri: { Value: !GetAtt GatewayMcpRepo.RepositoryUri, Export: { Name: !Sub "${AWS::StackName}-GatewayMcpRepoUri" } }
+  MockBluemarbleRepoUri: { Value: !GetAtt MockBluemarbleRepo.RepositoryUri, Export: { Name: !Sub "${AWS::StackName}-MockBluemarbleRepoUri" } }
+  MockSalesforceRepoUri: { Value: !GetAtt MockSalesforceRepo.RepositoryUri, Export: { Name: !Sub "${AWS::StackName}-MockSalesforceRepoUri" } }

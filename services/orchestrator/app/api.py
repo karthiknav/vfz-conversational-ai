@@ -1,5 +1,8 @@
+import os
+
 from langchain_core.messages import AIMessage, HumanMessage
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from app.agents import governance_agent
@@ -7,6 +10,22 @@ from app.graph import get_graph
 from app.langfuse_setup import get_callback_handler
 
 app = FastAPI(title="VZ Conversational AI Orchestrator")
+
+# Local dev defaults: lets the static UI (served from a different origin,
+# e.g. `python -m http.server` on :8080, or opened as a `file://` page which
+# sends Origin: null) call this API from the browser. See getting-started.md
+# §4 troubleshooting. In AWS, ALLOWED_ORIGINS carries the deployed CloudFront
+# domain (see infra/k8s/orchestrator/deployment.yaml) — added on top of, not
+# instead of, the local-dev origins so `kubectl port-forward` + local UI
+# testing against a deployed orchestrator still works.
+_extra_origins = [o for o in os.environ.get("ALLOWED_ORIGINS", "").split(",") if o]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:8080", "http://127.0.0.1:8080", "null"] + _extra_origins,
+    allow_methods=["GET", "POST"],
+    allow_headers=["Content-Type"],
+)
 
 
 class ChatRequest(BaseModel):

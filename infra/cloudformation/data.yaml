@@ -1,0 +1,105 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Single RDS PostgreSQL instance shared by the orchestrator's LangGraph
+  checkpointer (EKS side) and gateway-mcp/mocks' bluemarble/salesforce/audit
+  schemas (ECS side) — mirrors the repo's existing schema-per-system design
+  (docs/architecture-decisions.md ADR-3). Isolation between the two compute
+  platforms is enforced by security group, not by separate databases: this
+  stack only grants ingress from the EKS shared node SG; gateway-services.yaml
+  adds a second ingress rule from its own task SGs after they exist.
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: vfz-poc
+  NetworkStackName:
+    Type: String
+    Default: vfz-network
+  EksClusterStackName:
+    Type: String
+    Default: vfz-eks-cluster
+  DbInstanceClass:
+    Type: String
+    Default: db.t4g.micro
+  DbAllocatedStorageGb:
+    Type: Number
+    Default: 20
+
+Resources:
+  DbSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${EnvironmentName}/db-credentials"
+      GenerateSecretString:
+        SecretStringTemplate: '{"username":"vfz_admin"}'
+        GenerateStringKey: password
+        PasswordLength: 32
+        ExcludeCharacters: '"@/\'
+
+  DbSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: !Sub "${EnvironmentName} RDS subnet group - spans both eks-private and gateway-private"
+      SubnetIds:
+        - !ImportValue { "Fn::Sub": "${NetworkStackName}-EksPrivateSubnet1Id" }
+        - !ImportValue { "Fn::Sub": "${NetworkStackName}-EksPrivateSubnet2Id" }
+        - !ImportValue { "Fn::Sub": "${NetworkStackName}-GatewayPrivateSubnet1Id" }
+        - !ImportValue { "Fn::Sub": "${NetworkStackName}-GatewayPrivateSubnet2Id" }
+
+  DbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub "${EnvironmentName} RDS Postgres - ingress granted per-consumer, no default allow"
+      VpcId: !ImportValue { "Fn::Sub": "${NetworkStackName}-VpcId" }
+      SecurityGroupEgress:
+        - { IpProtocol: "-1", CidrIp: 127.0.0.1/32 } # no outbound needed from the DB itself
+
+  DbIngressFromEks:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref DbSecurityGroup
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+      SourceSecurityGroupId: !ImportValue { "Fn::Sub": "${EksClusterStackName}-ClusterSharedSecurityGroupId" }
+      Description: orchestrator pods (EKS shared node SG) -> Postgres
+
+  DbInstance:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Delete
+    Properties:
+      DBInstanceIdentifier: !Sub "${EnvironmentName}-db"
+      Engine: postgres
+      # Check `aws rds describe-db-engine-versions --engine postgres` for the
+      # current supported minor at deploy time — RDS deprecates minors
+      # regularly and this pin will age.
+      EngineVersion: "16.9"
+      DBInstanceClass: !Ref DbInstanceClass
+      AllocatedStorage: !Ref DbAllocatedStorageGb
+      StorageType: gp3
+      DBName: vfz_poc
+      MasterUsername: !Sub "{{resolve:secretsmanager:${DbSecret}:SecretString:username}}"
+      MasterUserPassword: !Sub "{{resolve:secretsmanager:${DbSecret}:SecretString:password}}"
+      DBSubnetGroupName: !Ref DbSubnetGroup
+      VPCSecurityGroups: [!Ref DbSecurityGroup]
+      PubliclyAccessible: false
+      MultiAZ: false
+      BackupRetentionPeriod: 1
+      StorageEncrypted: true
+
+Outputs:
+  DbEndpoint:
+    Value: !GetAtt DbInstance.Endpoint.Address
+    Export: { Name: !Sub "${AWS::StackName}-DbEndpoint" }
+  DbPort:
+    Value: !GetAtt DbInstance.Endpoint.Port
+    Export: { Name: !Sub "${AWS::StackName}-DbPort" }
+  DbName:
+    Value: vfz_poc
+    Export: { Name: !Sub "${AWS::StackName}-DbName" }
+  DbSecretArn:
+    Value: !Ref DbSecret
+    Export: { Name: !Sub "${AWS::StackName}-DbSecretArn" }
+  DbSecurityGroupId:
+    Value: !Ref DbSecurityGroup
+    Export: { Name: !Sub "${AWS::StackName}-DbSecurityGroupId" }

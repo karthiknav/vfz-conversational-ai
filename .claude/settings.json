@@ -4,7 +4,14 @@
       "Bash(xargs -0 -n1 python -m py_compile)",
       "Bash(docker --version)",
       "Bash(docker compose *)",
-      "Bash(docker info *)"
+      "Bash(docker info *)",
+      "Bash(docker build *)",
+      "Bash(docker run *)",
+      "Bash(curl -s -o /dev/null -w \"status: %{http_code}\\\\n\" http://localhost:18080/)",
+      "Bash(curl -s http://localhost:18080/)",
+      "Bash(docker stop *)",
+      "Bash(docker rm *)",
+      "Bash(docker rmi *)"
     ]
   }
 }

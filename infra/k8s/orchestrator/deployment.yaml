@@ -1,0 +1,59 @@
+# Placeholders (__LIKE_THIS__) are filled in by the deploy script from the
+# CloudFormation stack outputs — see infra/k8s/README.md. Requires the
+# checkpointer prerequisite change (MemorySaver -> AsyncPostgresSaver, see
+# services/orchestrator/app/graph.py) to be in the image before running with
+# replicas > 1.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: orchestrator
+  namespace: orchestrator
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app: orchestrator }
+  template:
+    metadata:
+      labels: { app: orchestrator }
+    spec:
+      serviceAccountName: orchestrator
+      containers:
+        - name: orchestrator
+          image: __ECR_ORCHESTRATOR_IMAGE_URI__
+          ports:
+            - containerPort: 8000
+          env:
+            - { name: AWS_REGION, value: "__AWS_REGION__" }
+            - { name: BEDROCK_MODEL_ID, value: "anthropic.claude-3-5-sonnet-20241022-v2:0" }
+            - { name: BEDROCK_GUARDRAIL_ID, value: "__BEDROCK_GUARDRAIL_ID__" }
+            - { name: BEDROCK_GUARDRAIL_VERSION, value: "DRAFT" }
+            - { name: LANGFUSE_HOST, value: "https://cloud.langfuse.com" }
+            - { name: GOVERNANCE_AUTO_APPROVE_DELTA_EUR, value: "15.00" }
+            - { name: POSTGRES_HOST, value: "__DB_ENDPOINT__" }
+            - { name: POSTGRES_PORT, value: "__DB_PORT__" }
+            - { name: POSTGRES_DB, value: "vfz_poc" }
+            - { name: ALLOWED_ORIGINS, value: "__UI_CLOUDFRONT_URL__" }
+          envFrom:
+            - secretRef: { name: orchestrator-secrets }
+          volumeMounts:
+            - name: secrets-store
+              mountPath: /mnt/secrets-store
+              readOnly: true
+          readinessProbe:
+            httpGet: { path: /health, port: 8000 }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /health, port: 8000 }
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          resources:
+            requests: { cpu: "250m", memory: "512Mi" }
+            limits: { cpu: "1", memory: "1Gi" }
+      volumes:
+        - name: secrets-store
+          csi:
+            driver: secrets-store.csi.k8s.io
+            readOnly: true
+            volumeAttributes:
+              secretProviderClass: orchestrator-secrets

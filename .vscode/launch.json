@@ -1,0 +1,117 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Orchestrator: debug /chat (uvicorn)",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "uvicorn",
+            "args": [
+                "app.api:app",
+                "--port",
+                "8000"
+            ],
+            "cwd": "${workspaceFolder}/services/orchestrator",
+            "python": "${workspaceFolder}/services/orchestrator/.venv/Scripts/python.exe",
+            "envFile": "${workspaceFolder}/.env",
+            "env": {
+                "GATEWAY_MCP_URL": "http://localhost:8090/mcp",
+                "GATEWAY_API_KEY": "dev-gateway-key",
+                "AWS_REGION": "us-east-1",
+                "BEDROCK_MODEL_ID": "us.anthropic.claude-sonnet-4-6"
+            },
+            "justMyCode": true
+        },
+        {
+            "name": "Gateway MCP: debug (uvicorn)",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "uvicorn",
+            "args": [
+                "app.asgi:app",
+                "--port",
+                "8090"
+            ],
+            "cwd": "${workspaceFolder}/services/gateway-mcp",
+            "python": "${workspaceFolder}/services/gateway-mcp/.venv/Scripts/python.exe",
+            "envFile": "${workspaceFolder}/.env",
+            "env": {
+                "POSTGRES_HOST": "localhost",
+                "POSTGRES_PORT": "5433",
+                "POSTGRES_USER": "vz_poc",
+                "POSTGRES_PASSWORD": "password",
+                "POSTGRES_DB": "vz_poc",
+                "GATEWAY_RATE_LIMIT_PER_MIN": "60",
+                "GATEWAY_API_KEY": "dev-gateway-key",
+                "BLUEMARBLE_BASE_URL": "http://localhost:8081",
+                "SALESFORCE_BASE_URL": "http://localhost:8082"
+            },
+            "justMyCode": true
+        },
+        {
+            "name": "Mock Bluemarble: debug (uvicorn)",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "uvicorn",
+            "args": [
+                "app.main:app",
+                "--port",
+                "8081"
+            ],
+            "cwd": "${workspaceFolder}/services/mock-bluemarble",
+            "python": "${workspaceFolder}/services/mock-bluemarble/.venv/Scripts/python.exe",
+            "envFile": "${workspaceFolder}/.env",
+            "env": {
+                "POSTGRES_HOST": "localhost",
+                "POSTGRES_PORT": "5433",
+                "POSTGRES_USER": "vz_poc",
+                "POSTGRES_PASSWORD": "password",
+                "POSTGRES_DB": "vz_poc"
+            },
+            "justMyCode": true
+        },
+        {
+            "name": "Mock Salesforce: debug (uvicorn)",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "uvicorn",
+            "args": [
+                "app.main:app",
+                "--port",
+                "8082"
+            ],
+            "cwd": "${workspaceFolder}/services/mock-salesforce",
+            "python": "${workspaceFolder}/services/mock-salesforce/.venv/Scripts/python.exe",
+            "envFile": "${workspaceFolder}/.env",
+            "env": {
+                "POSTGRES_HOST": "localhost",
+                "POSTGRES_PORT": "5433",
+                "POSTGRES_USER": "vz_poc",
+                "POSTGRES_PASSWORD": "password",
+                "POSTGRES_DB": "vz_poc"
+            },
+            "justMyCode": true
+        }
+    ],
+    "compounds": [
+        {
+            "name": "Debug: Orchestrator + Gateway + Bluemarble",
+            "configurations": [
+                "Orchestrator: debug /chat (uvicorn)",
+                "Gateway MCP: debug (uvicorn)",
+                "Mock Bluemarble: debug (uvicorn)"
+            ],
+            "stopAll": true
+        },
+        {
+            "name": "Debug: Orchestrator + Gateway + Bluemarble + Salesforce",
+            "configurations": [
+                "Orchestrator: debug /chat (uvicorn)",
+                "Gateway MCP: debug (uvicorn)",
+                "Mock Bluemarble: debug (uvicorn)",
+                "Mock Salesforce: debug (uvicorn)"
+            ],
+            "stopAll": true
+        }
+    ]
+}

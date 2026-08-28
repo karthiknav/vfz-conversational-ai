@@ -1,0 +1,27 @@
+:root {
+  --vz-red: #e60000;
+  --vz-red-dark: #b30000;
+  --vz-ink: #1b1b1f;
+  --vz-ink-soft: #52525b;
+  --vz-bg: #f4f4f6;
+  --vz-surface: #ffffff;
+  --vz-border: #d9d9df;
+  --vz-bubble-user: #e60000;
+  --vz-bubble-agent: #ffffff;
+  --vz-shadow: 0 12px 32px rgba(27, 27, 31, 0.18);
+  --vz-radius-sm: 8px;
+  --vz-radius-md: 14px;
+  --vz-radius-lg: 20px;
+  --vz-font: -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: var(--vz-font);
+  color: var(--vz-ink);
+  background: var(--vz-bg);
+}

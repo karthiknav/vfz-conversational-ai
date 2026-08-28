@@ -1,0 +1,88 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  EKS control plane for the orchestrator, plus its OIDC identity provider
+  (IRSA). Placed in the "eks-private" subnets from the network stack; the
+  cluster's public API endpoint stays enabled for kubectl access, but nodes
+  and pods live entirely in private subnets.
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: vfz-poc
+  NetworkStackName:
+    Type: String
+    Default: vfz-network
+  KubernetesVersion:
+    Type: String
+    Default: "1.31"
+
+Resources:
+  ClusterSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub "${EnvironmentName} EKS cluster control-plane ENIs"
+      VpcId: !ImportValue { "Fn::Sub": "${NetworkStackName}-VpcId" }
+
+  ClusterRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${EnvironmentName}-eks-cluster-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: eks.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEKSClusterPolicy
+
+  Cluster:
+    Type: AWS::EKS::Cluster
+    Properties:
+      Name: !Sub "${EnvironmentName}-orchestrator"
+      Version: !Ref KubernetesVersion
+      RoleArn: !GetAtt ClusterRole.Arn
+      AccessConfig:
+        AuthenticationMode: API_AND_CONFIG_MAP
+      ResourcesVpcConfig:
+        SubnetIds:
+          - !ImportValue { "Fn::Sub": "${NetworkStackName}-EksPrivateSubnet1Id" }
+          - !ImportValue { "Fn::Sub": "${NetworkStackName}-EksPrivateSubnet2Id" }
+        SecurityGroupIds: [!Ref ClusterSecurityGroup]
+        EndpointPrivateAccess: true
+        EndpointPublicAccess: true
+
+  # IRSA: lets pods assume IAM roles via a ServiceAccount annotation instead
+  # of node-wide instance-profile permissions. Thumbprint is Amazon Root CA1's
+  # well-known SHA1 fingerprint, the same one eksctl/CDK register for every
+  # EKS OIDC provider.
+  OidcProvider:
+    Type: AWS::IAM::OIDCProvider
+    Properties:
+      Url: !GetAtt Cluster.OpenIdConnectIssuerUrl
+      ClientIdList: ["sts.amazonaws.com"]
+      ThumbprintList: ["9e99a48a9960b14926bb7f3b02e22da2b0ab7280"]
+
+Outputs:
+  ClusterName:
+    Value: !Ref Cluster
+    Export: { Name: !Sub "${AWS::StackName}-ClusterName" }
+  ClusterEndpoint:
+    Value: !GetAtt Cluster.Endpoint
+    Export: { Name: !Sub "${AWS::StackName}-ClusterEndpoint" }
+  ControlPlaneSecurityGroupId:
+    Value: !Ref ClusterSecurityGroup
+    Export: { Name: !Sub "${AWS::StackName}-ControlPlaneSecurityGroupId" }
+  # Auto-created by EKS itself; attached to the control plane AND to managed
+  # node group instances by default (no custom launch-template SG override
+  # is used in eks-nodegroup.yaml) — this is the SG to grant DB/other
+  # ingress from, not ControlPlaneSecurityGroupId above.
+  ClusterSharedSecurityGroupId:
+    Value: !GetAtt Cluster.ClusterSecurityGroupId
+    Export: { Name: !Sub "${AWS::StackName}-ClusterSharedSecurityGroupId" }
+  OidcProviderArn:
+    Value: !Ref OidcProvider
+    Export: { Name: !Sub "${AWS::StackName}-OidcProviderArn" }
+  OidcIssuerUrl:
+    Value: !GetAtt Cluster.OpenIdConnectIssuerUrl
+    Export: { Name: !Sub "${AWS::StackName}-OidcIssuerUrl" }

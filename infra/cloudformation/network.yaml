@@ -1,0 +1,255 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  VPC for the vfz-conversational-ai EKS deployment. Two independently-routed
+  subnet groups in the same VPC: "eks-*" for the orchestrator's EKS cluster
+  and "gateway-*" for the gateway-mcp/mocks ECS Fargate platform. The two
+  groups share nothing but the VPC, IGW, and one NAT Gateway for egress —
+  there is no private routing shortcut between them, so the orchestrator
+  reaches gateway-mcp only via its public ALB, the same way it would reach
+  any third-party MCP provider.
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: vfz-poc
+  VpcCidr:
+    Type: String
+    Default: 10.0.0.0/16
+
+Resources:
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - { Key: Name, Value: !Sub "${EnvironmentName}-vpc" }
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags: [{ Key: Name, Value: !Sub "${EnvironmentName}-igw" }]
+
+  VpcGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  # ---------------------------------------------------------------- subnets
+  EksPublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.0.0.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - { Key: Name, Value: !Sub "${EnvironmentName}-eks-public-1" }
+        - { Key: kubernetes.io/role/elb, Value: "1" }
+
+  EksPublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - { Key: Name, Value: !Sub "${EnvironmentName}-eks-public-2" }
+        - { Key: kubernetes.io/role/elb, Value: "1" }
+
+  EksPrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.0.10.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      Tags:
+        - { Key: Name, Value: !Sub "${EnvironmentName}-eks-private-1" }
+        - { Key: kubernetes.io/role/internal-elb, Value: "1" }
+
+  EksPrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.0.11.0/24
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      Tags:
+        - { Key: Name, Value: !Sub "${EnvironmentName}-eks-private-2" }
+        - { Key: kubernetes.io/role/internal-elb, Value: "1" }
+
+  GatewayPublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.0.20.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags: [{ Key: Name, Value: !Sub "${EnvironmentName}-gateway-public-1" }]
+
+  GatewayPublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.0.21.0/24
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags: [{ Key: Name, Value: !Sub "${EnvironmentName}-gateway-public-2" }]
+
+  GatewayPrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.0.30.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      Tags: [{ Key: Name, Value: !Sub "${EnvironmentName}-gateway-private-1" }]
+
+  GatewayPrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.0.31.0/24
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      Tags: [{ Key: Name, Value: !Sub "${EnvironmentName}-gateway-private-2" }]
+
+  # ------------------------------------------------------------- NAT (shared)
+  NatEip:
+    Type: AWS::EC2::EIP
+    Properties: { Domain: vpc }
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEip.AllocationId
+      SubnetId: !Ref EksPublicSubnet1
+      Tags: [{ Key: Name, Value: !Sub "${EnvironmentName}-nat" }]
+
+  # ------------------------------------------------------------- route tables
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags: [{ Key: Name, Value: !Sub "${EnvironmentName}-public-rt" }]
+
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VpcGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  EksPublicSubnet1RtAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref EksPublicSubnet1, RouteTableId: !Ref PublicRouteTable }
+  EksPublicSubnet2RtAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref EksPublicSubnet2, RouteTableId: !Ref PublicRouteTable }
+  GatewayPublicSubnet1RtAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref GatewayPublicSubnet1, RouteTableId: !Ref PublicRouteTable }
+  GatewayPublicSubnet2RtAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref GatewayPublicSubnet2, RouteTableId: !Ref PublicRouteTable }
+
+  EksPrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags: [{ Key: Name, Value: !Sub "${EnvironmentName}-eks-private-rt" }]
+
+  EksPrivateDefaultRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref EksPrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+  EksPrivateSubnet1RtAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref EksPrivateSubnet1, RouteTableId: !Ref EksPrivateRouteTable }
+  EksPrivateSubnet2RtAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref EksPrivateSubnet2, RouteTableId: !Ref EksPrivateRouteTable }
+
+  GatewayPrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags: [{ Key: Name, Value: !Sub "${EnvironmentName}-gateway-private-rt" }]
+
+  GatewayPrivateDefaultRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref GatewayPrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+  GatewayPrivateSubnet1RtAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref GatewayPrivateSubnet1, RouteTableId: !Ref GatewayPrivateRouteTable }
+  GatewayPrivateSubnet2RtAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref GatewayPrivateSubnet2, RouteTableId: !Ref GatewayPrivateRouteTable }
+
+  # ---------------------------------------------------------- VPC endpoints
+  # Bedrock + Secrets Manager traffic from the orchestrator stays off the
+  # NAT path. Only NAT-routed egress is: reaching gateway-mcp's public ALB,
+  # ECR image pulls (no ECR/S3 gateway endpoints here — POC-scale, adds cost
+  # for little benefit given each service only pulls its image once per
+  # deploy), and Langfuse Cloud.
+  VpcEndpointSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Interface VPC endpoints - HTTPS from inside the VPC only
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 443, ToPort: 443, CidrIp: !Ref VpcCidr }
+
+  BedrockRuntimeEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.bedrock-runtime"
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds: [!Ref EksPrivateSubnet1, !Ref EksPrivateSubnet2]
+      SecurityGroupIds: [!Ref VpcEndpointSg]
+
+  SecretsManagerEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.secretsmanager"
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds: [!Ref EksPrivateSubnet1, !Ref EksPrivateSubnet2, !Ref GatewayPrivateSubnet1, !Ref GatewayPrivateSubnet2]
+      SecurityGroupIds: [!Ref VpcEndpointSg]
+
+Outputs:
+  VpcId:
+    Value: !Ref Vpc
+    Export: { Name: !Sub "${AWS::StackName}-VpcId" }
+  VpcCidr:
+    Value: !Ref VpcCidr
+    Export: { Name: !Sub "${AWS::StackName}-VpcCidr" }
+  EksPublicSubnetIds:
+    Value: !Join [",", [!Ref EksPublicSubnet1, !Ref EksPublicSubnet2]]
+    Export: { Name: !Sub "${AWS::StackName}-EksPublicSubnetIds" }
+  EksPrivateSubnetIds:
+    Value: !Join [",", [!Ref EksPrivateSubnet1, !Ref EksPrivateSubnet2]]
+    Export: { Name: !Sub "${AWS::StackName}-EksPrivateSubnetIds" }
+  GatewayPublicSubnetIds:
+    Value: !Join [",", [!Ref GatewayPublicSubnet1, !Ref GatewayPublicSubnet2]]
+    Export: { Name: !Sub "${AWS::StackName}-GatewayPublicSubnetIds" }
+  GatewayPrivateSubnetIds:
+    Value: !Join [",", [!Ref GatewayPrivateSubnet1, !Ref GatewayPrivateSubnet2]]
+    Export: { Name: !Sub "${AWS::StackName}-GatewayPrivateSubnetIds" }
+  EksPrivateSubnet1Id: { Value: !Ref EksPrivateSubnet1, Export: { Name: !Sub "${AWS::StackName}-EksPrivateSubnet1Id" } }
+  EksPrivateSubnet2Id: { Value: !Ref EksPrivateSubnet2, Export: { Name: !Sub "${AWS::StackName}-EksPrivateSubnet2Id" } }
+  GatewayPrivateSubnet1Id: { Value: !Ref GatewayPrivateSubnet1, Export: { Name: !Sub "${AWS::StackName}-GatewayPrivateSubnet1Id" } }
+  GatewayPrivateSubnet2Id: { Value: !Ref GatewayPrivateSubnet2, Export: { Name: !Sub "${AWS::StackName}-GatewayPrivateSubnet2Id" } }
+  GatewayPublicSubnet1Id: { Value: !Ref GatewayPublicSubnet1, Export: { Name: !Sub "${AWS::StackName}-GatewayPublicSubnet1Id" } }
+  GatewayPublicSubnet2Id: { Value: !Ref GatewayPublicSubnet2, Export: { Name: !Sub "${AWS::StackName}-GatewayPublicSubnet2Id" } }

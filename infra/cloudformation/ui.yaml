@@ -1,0 +1,80 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  S3 + CloudFront for the static chat UI — port of infra/cdk/stacks/ui_stack.py.
+  Deploy this last: the S3 sync must contain services/ui/dist built with
+  window.ORCHESTRATOR_BASE_URL already injected into index.html, pointing at
+  the orchestrator's Ingress ALB hostname (see infra/k8s/orchestrator/ and
+  the deployment README for the exact step).
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: vfz-poc
+
+Resources:
+  UiBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${EnvironmentName}-ui-${AWS::AccountId}-${AWS::Region}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  OriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub "${EnvironmentName}-ui-oac"
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        DefaultRootObject: index.html
+        Origins:
+          - Id: ui-s3-origin
+            DomainName: !GetAtt UiBucket.RegionalDomainName
+            OriginAccessControlId: !Ref OriginAccessControl
+            S3OriginConfig: { OriginAccessIdentity: "" }
+        DefaultCacheBehavior:
+          TargetOriginId: ui-s3-origin
+          ViewerProtocolPolicy: redirect-to-https
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6 # AWS managed: CachingOptimized
+        # SPA-style fallback isn't needed (static multi-page-ish index.html),
+        # but keep 403/404 -> index.html so deep links into the widget don't
+        # break if routing is added later.
+        CustomErrorResponses:
+          - { ErrorCode: 403, ResponseCode: 200, ResponsePagePath: /index.html }
+          - { ErrorCode: 404, ResponseCode: 200, ResponsePagePath: /index.html }
+
+  UiBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref UiBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: cloudfront.amazonaws.com }
+            Action: s3:GetObject
+            Resource: !Sub "${UiBucket.Arn}/*"
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${Distribution}"
+
+Outputs:
+  UiBucketName:
+    Value: !Ref UiBucket
+    Export: { Name: !Sub "${AWS::StackName}-UiBucketName" }
+  DistributionId:
+    Value: !Ref Distribution
+    Export: { Name: !Sub "${AWS::StackName}-DistributionId" }
+  UiUrl:
+    Value: !Sub "https://${Distribution.DomainName}"
+    Export: { Name: !Sub "${AWS::StackName}-UiUrl" }

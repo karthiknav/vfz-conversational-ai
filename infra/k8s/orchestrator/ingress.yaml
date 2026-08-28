@@ -1,0 +1,27 @@
+# Requires the AWS Load Balancer Controller installed cluster-wide first —
+# see infra/k8s/README.md "Cluster bootstrap". Creates a public ALB; no ACM
+# certificate wired up here (POC, no custom domain) — HTTP only. Add
+# alb.ingress.kubernetes.io/certificate-arn once a domain + ACM cert exist,
+# and add the CloudFront domain to CORS allow_origins in
+# services/orchestrator/app/api.py before that ALB is UI-facing.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: orchestrator
+  namespace: orchestrator
+  annotations:
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/healthcheck-path: /health
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 80}]'
+spec:
+  ingressClassName: alb
+  rules:
+    - http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: orchestrator
+                port: { number: 8000 }

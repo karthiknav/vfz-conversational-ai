@@ -1,0 +1,69 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Managed node group for the orchestrator's EKS cluster, in the eks-private
+  subnets only.
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: vfz-poc
+  NetworkStackName:
+    Type: String
+    Default: vfz-network
+  EksClusterStackName:
+    Type: String
+    Default: vfz-eks-cluster
+  InstanceType:
+    Type: String
+    Default: t3.medium
+  DesiredSize:
+    Type: Number
+    Default: 2
+  MinSize:
+    Type: Number
+    Default: 2
+  MaxSize:
+    Type: Number
+    Default: 4
+
+Resources:
+  NodeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${EnvironmentName}-eks-node-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+        - arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy
+
+  NodeGroup:
+    Type: AWS::EKS::Nodegroup
+    Properties:
+      ClusterName: !ImportValue { "Fn::Sub": "${EksClusterStackName}-ClusterName" }
+      NodegroupName: !Sub "${EnvironmentName}-orchestrator-nodes"
+      NodeRole: !GetAtt NodeRole.Arn
+      InstanceTypes: [!Ref InstanceType]
+      AmiType: AL2023_x86_64_STANDARD
+      Subnets:
+        - !ImportValue { "Fn::Sub": "${NetworkStackName}-EksPrivateSubnet1Id" }
+        - !ImportValue { "Fn::Sub": "${NetworkStackName}-EksPrivateSubnet2Id" }
+      ScalingConfig:
+        DesiredSize: !Ref DesiredSize
+        MinSize: !Ref MinSize
+        MaxSize: !Ref MaxSize
+      UpdateConfig:
+        MaxUnavailable: 1
+
+Outputs:
+  NodeRoleArn:
+    Value: !GetAtt NodeRole.Arn
+    Export: { Name: !Sub "${AWS::StackName}-NodeRoleArn" }
+  NodegroupName:
+    Value: !Ref NodeGroup
+    Export: { Name: !Sub "${AWS::StackName}-NodegroupName" }

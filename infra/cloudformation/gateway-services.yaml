@@ -1,0 +1,399 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  gateway-mcp + mock-bluemarble + mock-salesforce on the gateway ECS cluster,
+  in the gateway-private subnets. gateway-mcp is the only one with a public
+  ALB (this is the "remote MCP server" endpoint the orchestrator calls); the
+  mocks are reachable only from gateway-mcp's own security group via a
+  private Cloud Map namespace, never from the EKS side directly. Also
+  publishes GATEWAY_MCP_URL as an SSM parameter once the ALB DNS name is
+  known, and adds this stack's task security groups as DB ingress sources on
+  top of the EKS-side rule already in data.yaml.
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: vfz-poc
+  NetworkStackName:
+    Type: String
+    Default: vfz-network
+  GatewayEcsClusterStackName:
+    Type: String
+    Default: vfz-gateway-ecs-cluster
+  EcrStackName:
+    Type: String
+    Default: vfz-ecr
+  DataStackName:
+    Type: String
+    Default: vfz-data
+  AppSecretsStackName:
+    Type: String
+    Default: vfz-app-secrets
+  ImageTag:
+    Type: String
+    Default: latest
+
+Resources:
+  # --------------------------------------------------------------- discovery
+  Namespace:
+    Type: AWS::ServiceDiscovery::PrivateDnsNamespace
+    Properties:
+      Name: gateway.internal
+      Vpc: !ImportValue { "Fn::Sub": "${NetworkStackName}-VpcId" }
+
+  BluemarbleDiscovery:
+    Type: AWS::ServiceDiscovery::Service
+    Properties:
+      Name: mock-bluemarble
+      DnsConfig:
+        NamespaceId: !Ref Namespace
+        DnsRecords: [{ Type: A, TTL: 10 }]
+
+  SalesforceDiscovery:
+    Type: AWS::ServiceDiscovery::Service
+    Properties:
+      Name: mock-salesforce
+      DnsConfig:
+        NamespaceId: !Ref Namespace
+        DnsRecords: [{ Type: A, TTL: 10 }]
+
+  # -------------------------------------------------------------- IAM (exec)
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${EnvironmentName}-gateway-task-exec-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: ReadDbAndGatewaySecrets
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource:
+                  - !ImportValue { "Fn::Sub": "${DataStackName}-DbSecretArn" }
+                  - !ImportValue { "Fn::Sub": "${AppSecretsStackName}-GatewayApiKeySecretArn" }
+
+  # ---------------------------------------------------------------- gateway-mcp
+  GatewayLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: { LogGroupName: !Sub "/ecs/${EnvironmentName}/gateway-mcp", RetentionInDays: 7 }
+
+  GatewayTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${EnvironmentName}-gateway-mcp-task-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        # Defense-in-depth: gateway-mcp talks to the mocks and Postgres only.
+        # Explicit deny even though nothing else grants Bedrock here — see
+        # infra/cdk/stacks/gateway_stack.py for the pattern this carries forward.
+        - PolicyName: DenyBedrock
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Deny
+                Action: ["bedrock:InvokeModel", "bedrock:InvokeModelWithResponseStream"]
+                Resource: "*"
+
+  GatewayTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${EnvironmentName}-gateway-mcp"
+      Cpu: "512"
+      Memory: "1024"
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt GatewayTaskRole.Arn
+      ContainerDefinitions:
+        - Name: gateway-mcp
+          Image: !Sub
+            - "${RepoUri}:${ImageTag}"
+            - RepoUri: !ImportValue { "Fn::Sub": "${EcrStackName}-GatewayMcpRepoUri" }
+          PortMappings: [{ ContainerPort: 8090 }]
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref GatewayLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: gateway-mcp
+          Environment:
+            - { Name: POSTGRES_HOST, Value: !ImportValue { "Fn::Sub": "${DataStackName}-DbEndpoint" } }
+            - { Name: POSTGRES_PORT, Value: !ImportValue { "Fn::Sub": "${DataStackName}-DbPort" } }
+            - { Name: POSTGRES_DB, Value: !ImportValue { "Fn::Sub": "${DataStackName}-DbName" } }
+            - { Name: BLUEMARBLE_BASE_URL, Value: "http://mock-bluemarble.gateway.internal:8081" }
+            - { Name: SALESFORCE_BASE_URL, Value: "http://mock-salesforce.gateway.internal:8082" }
+            - { Name: GATEWAY_RATE_LIMIT_PER_MIN, Value: "60" }
+          Secrets:
+            - Name: POSTGRES_USER
+              ValueFrom: !Sub
+                - "${DbSecretArn}:username::"
+                - DbSecretArn: !ImportValue { "Fn::Sub": "${DataStackName}-DbSecretArn" }
+            - Name: POSTGRES_PASSWORD
+              ValueFrom: !Sub
+                - "${DbSecretArn}:password::"
+                - DbSecretArn: !ImportValue { "Fn::Sub": "${DataStackName}-DbSecretArn" }
+            - Name: GATEWAY_API_KEY
+              ValueFrom: !Sub
+                - "${GatewaySecretArn}:api_key::"
+                - GatewaySecretArn: !ImportValue { "Fn::Sub": "${AppSecretsStackName}-GatewayApiKeySecretArn" }
+
+  GatewayAlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub "${EnvironmentName} gateway-mcp public ALB - 80 from internet"
+      VpcId: !ImportValue { "Fn::Sub": "${NetworkStackName}-VpcId" }
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: 0.0.0.0/0 }
+
+  GatewayTaskSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub "${EnvironmentName} gateway-mcp Fargate task - 8090 from its own ALB only"
+      VpcId: !ImportValue { "Fn::Sub": "${NetworkStackName}-VpcId" }
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 8090, ToPort: 8090, SourceSecurityGroupId: !Ref GatewayAlbSecurityGroup }
+
+  GatewayAlb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub "${EnvironmentName}-gateway-mcp"
+      Scheme: internet-facing
+      Type: application
+      SecurityGroups: [!Ref GatewayAlbSecurityGroup]
+      Subnets:
+        - !ImportValue { "Fn::Sub": "${NetworkStackName}-GatewayPublicSubnet1Id" }
+        - !ImportValue { "Fn::Sub": "${NetworkStackName}-GatewayPublicSubnet2Id" }
+
+  GatewayTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub "${EnvironmentName}-gateway-mcp-tg"
+      Port: 8090
+      Protocol: HTTP
+      TargetType: ip
+      VpcId: !ImportValue { "Fn::Sub": "${NetworkStackName}-VpcId" }
+      HealthCheckPath: /health
+      HealthCheckIntervalSeconds: 15
+
+  GatewayListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref GatewayAlb
+      Port: 80
+      Protocol: HTTP
+      DefaultActions: [{ Type: forward, TargetGroupArn: !Ref GatewayTargetGroup }]
+
+  GatewayService:
+    Type: AWS::ECS::Service
+    DependsOn: GatewayListener
+    Properties:
+      ServiceName: !Sub "${EnvironmentName}-gateway-mcp"
+      Cluster: !ImportValue { "Fn::Sub": "${GatewayEcsClusterStackName}-ClusterArn" }
+      TaskDefinition: !Ref GatewayTaskDefinition
+      DesiredCount: 1
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets:
+            - !ImportValue { "Fn::Sub": "${NetworkStackName}-GatewayPrivateSubnet1Id" }
+            - !ImportValue { "Fn::Sub": "${NetworkStackName}-GatewayPrivateSubnet2Id" }
+          SecurityGroups: [!Ref GatewayTaskSecurityGroup]
+      LoadBalancers:
+        - { ContainerName: gateway-mcp, ContainerPort: 8090, TargetGroupArn: !Ref GatewayTargetGroup }
+
+  # ----------------------------------------------------------- mock-bluemarble
+  BluemarbleLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: { LogGroupName: !Sub "/ecs/${EnvironmentName}/mock-bluemarble", RetentionInDays: 7 }
+
+  BluemarbleTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${EnvironmentName}-mock-bluemarble"
+      Cpu: "256"
+      Memory: "512"
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      ContainerDefinitions:
+        - Name: mock-bluemarble
+          Image: !Sub
+            - "${RepoUri}:${ImageTag}"
+            - RepoUri: !ImportValue { "Fn::Sub": "${EcrStackName}-MockBluemarbleRepoUri" }
+          PortMappings: [{ ContainerPort: 8081 }]
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref BluemarbleLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: mock-bluemarble
+          Environment:
+            - { Name: POSTGRES_HOST, Value: !ImportValue { "Fn::Sub": "${DataStackName}-DbEndpoint" } }
+            - { Name: POSTGRES_PORT, Value: !ImportValue { "Fn::Sub": "${DataStackName}-DbPort" } }
+            - { Name: POSTGRES_DB, Value: !ImportValue { "Fn::Sub": "${DataStackName}-DbName" } }
+          Secrets:
+            - Name: POSTGRES_USER
+              ValueFrom: !Sub
+                - "${DbSecretArn}:username::"
+                - DbSecretArn: !ImportValue { "Fn::Sub": "${DataStackName}-DbSecretArn" }
+            - Name: POSTGRES_PASSWORD
+              ValueFrom: !Sub
+                - "${DbSecretArn}:password::"
+                - DbSecretArn: !ImportValue { "Fn::Sub": "${DataStackName}-DbSecretArn" }
+
+  BluemarbleSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub "${EnvironmentName} mock-bluemarble - 8081 from gateway-mcp task SG only"
+      VpcId: !ImportValue { "Fn::Sub": "${NetworkStackName}-VpcId" }
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 8081, ToPort: 8081, SourceSecurityGroupId: !Ref GatewayTaskSecurityGroup }
+
+  BluemarbleService:
+    Type: AWS::ECS::Service
+    Properties:
+      ServiceName: !Sub "${EnvironmentName}-mock-bluemarble"
+      Cluster: !ImportValue { "Fn::Sub": "${GatewayEcsClusterStackName}-ClusterArn" }
+      TaskDefinition: !Ref BluemarbleTaskDefinition
+      DesiredCount: 1
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets:
+            - !ImportValue { "Fn::Sub": "${NetworkStackName}-GatewayPrivateSubnet1Id" }
+            - !ImportValue { "Fn::Sub": "${NetworkStackName}-GatewayPrivateSubnet2Id" }
+          SecurityGroups: [!Ref BluemarbleSecurityGroup]
+      ServiceRegistries: [{ RegistryArn: !GetAtt BluemarbleDiscovery.Arn }]
+
+  # ----------------------------------------------------------- mock-salesforce
+  SalesforceLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: { LogGroupName: !Sub "/ecs/${EnvironmentName}/mock-salesforce", RetentionInDays: 7 }
+
+  SalesforceTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${EnvironmentName}-mock-salesforce"
+      Cpu: "256"
+      Memory: "512"
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      ContainerDefinitions:
+        - Name: mock-salesforce
+          Image: !Sub
+            - "${RepoUri}:${ImageTag}"
+            - RepoUri: !ImportValue { "Fn::Sub": "${EcrStackName}-MockSalesforceRepoUri" }
+          PortMappings: [{ ContainerPort: 8082 }]
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref SalesforceLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: mock-salesforce
+          Environment:
+            - { Name: POSTGRES_HOST, Value: !ImportValue { "Fn::Sub": "${DataStackName}-DbEndpoint" } }
+            - { Name: POSTGRES_PORT, Value: !ImportValue { "Fn::Sub": "${DataStackName}-DbPort" } }
+            - { Name: POSTGRES_DB, Value: !ImportValue { "Fn::Sub": "${DataStackName}-DbName" } }
+          Secrets:
+            - Name: POSTGRES_USER
+              ValueFrom: !Sub
+                - "${DbSecretArn}:username::"
+                - DbSecretArn: !ImportValue { "Fn::Sub": "${DataStackName}-DbSecretArn" }
+            - Name: POSTGRES_PASSWORD
+              ValueFrom: !Sub
+                - "${DbSecretArn}:password::"
+                - DbSecretArn: !ImportValue { "Fn::Sub": "${DataStackName}-DbSecretArn" }
+
+  SalesforceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub "${EnvironmentName} mock-salesforce - 8082 from gateway-mcp task SG only"
+      VpcId: !ImportValue { "Fn::Sub": "${NetworkStackName}-VpcId" }
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 8082, ToPort: 8082, SourceSecurityGroupId: !Ref GatewayTaskSecurityGroup }
+
+  SalesforceService:
+    Type: AWS::ECS::Service
+    Properties:
+      ServiceName: !Sub "${EnvironmentName}-mock-salesforce"
+      Cluster: !ImportValue { "Fn::Sub": "${GatewayEcsClusterStackName}-ClusterArn" }
+      TaskDefinition: !Ref SalesforceTaskDefinition
+      DesiredCount: 1
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets:
+            - !ImportValue { "Fn::Sub": "${NetworkStackName}-GatewayPrivateSubnet1Id" }
+            - !ImportValue { "Fn::Sub": "${NetworkStackName}-GatewayPrivateSubnet2Id" }
+          SecurityGroups: [!Ref SalesforceSecurityGroup]
+      ServiceRegistries: [{ RegistryArn: !GetAtt SalesforceDiscovery.Arn }]
+
+  # ------------------------------------------------------- DB ingress (ECS side)
+  DbIngressFromGateway:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !ImportValue { "Fn::Sub": "${DataStackName}-DbSecurityGroupId" }
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+      SourceSecurityGroupId: !Ref GatewayTaskSecurityGroup
+      Description: gateway-mcp task SG -> Postgres (covers gateway-mcp; mocks reach Postgres through the same SG's peers below)
+  DbIngressFromBluemarble:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !ImportValue { "Fn::Sub": "${DataStackName}-DbSecurityGroupId" }
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+      SourceSecurityGroupId: !Ref BluemarbleSecurityGroup
+      Description: mock-bluemarble -> Postgres
+  DbIngressFromSalesforce:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !ImportValue { "Fn::Sub": "${DataStackName}-DbSecurityGroupId" }
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+      SourceSecurityGroupId: !Ref SalesforceSecurityGroup
+      Description: mock-salesforce -> Postgres
+
+  # ------------------------------------------------------- publish the URL
+  GatewayMcpUrlParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${EnvironmentName}/gateway-mcp-url"
+      Type: String
+      Value: !Sub "http://${GatewayAlb.DNSName}/mcp"
+      Description: >
+        Consumed by the orchestrator's k8s Deployment as GATEWAY_MCP_URL.
+        HTTP only for this POC (no custom domain/ACM cert) — a real
+        third-party MCP endpoint would be HTTPS; add a domain + ACM
+        certificate + HTTPS listener here before treating this as production.
+
+Outputs:
+  GatewayMcpAlbDnsName:
+    Value: !GetAtt GatewayAlb.DNSName
+    Export: { Name: !Sub "${AWS::StackName}-GatewayMcpAlbDnsName" }
+  GatewayMcpUrl:
+    Value: !Sub "http://${GatewayAlb.DNSName}/mcp"
+    Export: { Name: !Sub "${AWS::StackName}-GatewayMcpUrl" }
+  GatewayMcpUrlParameterName:
+    Value: !Ref GatewayMcpUrlParameter
+    Export: { Name: !Sub "${AWS::StackName}-GatewayMcpUrlParameterName" }

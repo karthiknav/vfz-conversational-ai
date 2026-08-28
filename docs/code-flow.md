@@ -44,7 +44,7 @@ api.py returns ChatResponse → chat.js renders the bubble
 
 ### 1.1 Browser → Orchestrator
 
-[`services/ui/chat.js`](../services/ui/chat.js) POSTs `{customer_id, thread_id, message}` to `POST /chat` on the orchestrator.
+[`services/ui/src/widget/chat.js`](../services/ui/src/widget/chat.js) POSTs `{customer_id, thread_id, message}` to `POST /chat` on the orchestrator.
 
 ### 1.2 FastAPI entry point
 

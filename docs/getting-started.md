@@ -6,6 +6,7 @@ This walks through bringing the whole stack up via Docker Compose (the fast path
 
 - Docker Desktop (Compose v2)
 - Python 3.12+ (only needed if you'll run a service outside Docker, or use the `scripts/` helpers)
+- Node 20+ (only needed if you'll run `ui` outside Docker — see §3.6)
 - AWS credentials with Bedrock access in `eu-west-1` (or whichever `AWS_REGION` you set) — **every chat turn calls Claude**, so the orchestrator won't produce useful replies without this. Health/routing/DB plumbing all work without it; the LLM calls will not.
 - Langfuse Cloud keys — optional, tracing just no-ops without them
 
@@ -32,7 +33,7 @@ python scripts/mcp_smoke_test.py          # confirms the Gateway's MCP server an
 ```
 
 Then either:
-- Open **http://localhost:8080** for the chat UI, or
+- Open **http://localhost:8080** for the mock site + chat widget, or
 - Drive the API directly (same `.venv`, activate it again if you're in a new shell):
   ```bash
   python scripts/golden_path_test.py --branch auto_approve
@@ -55,7 +56,7 @@ To stop everything: `docker compose down` (add `-v` to also drop the Postgres vo
 | `orchestrator` | 8000 | `GET /health` | `gateway-mcp` |
 | `ui` | 8080 | `GET /` | `orchestrator` |
 
-Every Python service is `FROM python:3.12-slim`, installs its own `requirements.txt`, and is run with Uvicorn (see each `Dockerfile`). `ui` is plain static files served by nginx — no build step.
+Every Python service is `FROM python:3.12-slim`, installs its own `requirements.txt`, and is run with Uvicorn (see each `Dockerfile`). `ui` is a Vite-built static bundle served by nginx — the Dockerfile's Node stage runs `npm install && npm run build` and the nginx stage just serves the resulting `dist/`.
 
 ## 3. Running the services one by one (active development, no shortcuts)
 
@@ -63,7 +64,7 @@ This is the full manual walkthrough — bring each service up standalone, in dep
 
 Every step assumes you're at the repo root unless a step says `cd`. Commands below are written for bash (Git Bash on Windows, or a regular shell on macOS/Linux) — each venv activation line calls out both paths inline (Windows venvs put the activate script under `Scripts/`, not `bin/`). If you're on Windows PowerShell instead, replace `export VAR=value` with `$env:VAR = "value"` and `source .venv/Scripts/activate` with `.venv\Scripts\Activate.ps1`.
 
-Each service that has its own `requirements.txt` (`mock-bluemarble`, `mock-salesforce`, `gateway-mcp`, `orchestrator`) gets its **own** `.venv` inside that service's directory — their dependency sets diverge (e.g. `orchestrator` pulls in `langgraph`/`boto3`, the mocks don't), so a shared venv isn't safe to reuse across them. `ui` has no `requirements.txt` and needs no venv at all — it's served with the plain system `python -m http.server`.
+Each service that has its own `requirements.txt` (`mock-bluemarble`, `mock-salesforce`, `gateway-mcp`, `orchestrator`) gets its **own** `.venv` inside that service's directory — their dependency sets diverge (e.g. `orchestrator` pulls in `langgraph`/`boto3`, the mocks don't), so a shared venv isn't safe to reuse across them. `ui` is Node/Vite-based instead of Python — run `npm install` once inside `services/ui` (its own `node_modules/`, not shared with anything) and use `npm run dev`/`npm run build` per §3.6 below.
 
 ### 1. `db` — Postgres
 
@@ -241,26 +242,29 @@ curl -X POST http://localhost:8000/approve/PROP-A1B2C3 \
 
 A €10.00 delta is under the default `GOVERNANCE_AUTO_APPROVE_DELTA_EUR` (€15.00), so this auto-approves and creates a real order in `mock-bluemarble` — confirm with `curl http://localhost:8081/productOrderingManagement/v4/productOrder/<order-id>` (id comes back in the `/approve` response's `result.order.id`). See [`demo-script.md`](demo-script.md) for the escalation and partial-failure branches.
 
-### 6. `ui` — static chat UI (port 8080)
+### 6. `ui` — VodafoneZiggo mock site + chat widget (port 8080)
 
-Depends on: `orchestrator` (step 5). No build step — plain HTML/CSS/JS.
+Depends on: `orchestrator` (step 5). Vite-based (vanilla JS/CSS, no framework) — needs a one-time `npm install`.
 
 ```bash
 cd services/ui
-python -m http.server 8080
+npm install       # first time only
+npm run dev       # Vite dev server on :8080, with HMR
 ```
 
-`chat.js` defaults `ORCHESTRATOR_BASE_URL` to `http://localhost:8000`, so this works as-is once step 5 is up. To point it at a non-default orchestrator URL, set `window.ORCHESTRATOR_BASE_URL` before `chat.js` loads (e.g. a small inline `<script>` in `index.html`).
+To test the production bundle instead of the dev server, use `npm run build && npm run preview` (also serves on :8080).
 
-Open **http://localhost:8080** and verify the chat responds.
+The homepage is a mock VodafoneZiggo marketing/self-service page; the chat assistant is a floating launcher button (bottom-right) that opens a slide-up widget panel, not a separate page. `src/widget/chat.js` defaults `ORCHESTRATOR_BASE_URL` to `http://localhost:8000`, so this works as-is once step 5 is up. To point it at a non-default orchestrator URL, set `window.ORCHESTRATOR_BASE_URL` before the bundled module script loads (a small inline `<script>` in `index.html`, before the `<script type="module">` tag).
 
-**Test locally** — no separate API test needed here since it's a static frontend; the real test is exercising it in a browser: open dev tools' Network tab, send a message, and confirm a `POST /chat` fires against `http://localhost:8000` and renders the reply. A blank/erroring UI with a healthy `orchestrator` from step 5 is almost always the CORS issue noted below, not a UI bug.
+Open **http://localhost:8080**, click the chat launcher, and verify the chat responds.
+
+**Test locally** — no separate API test needed here since it's a frontend; the real test is exercising it in a browser: open the widget panel, send a message, and confirm in dev tools' Network tab that a `POST /chat` fires against `http://localhost:8000` and renders the reply.
 
 ## 4. Troubleshooting
 
 - **Postgres port 5432 already in use / auth fails against the Docker `db` even with the right password** — usually a native Postgres install on the host (common on Windows/Mac dev machines) already bound to 5432, silently answering instead of the container. `docker-compose.yml` maps the `db` service to **host port 5433** (container-internal port stays the standard 5432) specifically to avoid this collision. Any *host*-side connection — `psql -h localhost`, pgAdmin, or a service run standalone outside Docker (§3) — must use port **5433**, not 5432. Containers talking to each other over the Compose network (`POSTGRES_HOST=db`) are unaffected; they always use 5432 internally.
 - **`KeyError: 'GATEWAY_API_KEY'` on startup** — both `gateway-mcp` and `orchestrator` read this with `os.environ[...]` (no default, since it's a credential). Make sure it's exported in whichever shell/`.env` is feeding that process, and that both services use the *same* value.
 - **Chat replies are empty/error out, everything else works** — almost always missing or invalid AWS Bedrock credentials/region, or no model access granted for `BEDROCK_MODEL_ID` in that account/region. Health checks and DB-backed routes don't need AWS at all, so they'll look fine even when this is broken.
-- **UI shows a network error calling `/chat` when `ui` and `orchestrator` run in separate containers on different ports** — there's no CORS middleware on the orchestrator today, so a browser can block the cross-origin POST from `localhost:8080` to `localhost:8000` depending on browser/version. If you hit this, either serve the UI as a plain local file (`file://` origin issues aside, `python -m http.server` from `services/ui` works around it in practice) or add `fastapi.middleware.cors.CORSMiddleware` to `api.py` for local dev.
+- **UI shows a network error calling `/chat`** — `api.py` has `CORSMiddleware` allowing `http://localhost:8080`, `http://127.0.0.1:8080`, and `null` (the `Origin` a `file://`-opened page sends). If you're serving the UI from a different host/port, add that origin to `allow_origins` in `api.py`.
 - **`gateway-mcp` can't reach Postgres when run outside Docker** — set `POSTGRES_HOST=localhost` (the container network hostname `db` only resolves inside the Compose network).
 - **Seed data missing** — rerun `python scripts/seed_db.py --check`; the SQL under `db/init/` only runs automatically on a *fresh* Postgres volume (`docker compose down -v` to force re-seeding).
