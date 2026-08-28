@@ -201,6 +201,30 @@ helm repo add metrics-server https://kubernetes-sigs.github.io/metrics-server/
 helm install metrics-server metrics-server/metrics-server -n kube-system
 ```
 
+**How secrets actually get to the orchestrator pod:** the two `secrets-store-csi-driver`
+commands above install two separate DaemonSets, not one — the generic CSI driver
+(`helm install csi-secrets-store ...`) implements the Kubernetes CSI mount interface but
+doesn't know AWS exists; the `kubectl apply .../aws-provider-installer.yaml` line installs
+the AWS Secrets and Configuration Provider (ASCP), the piece that actually calls
+Secrets Manager/SSM.
+
+At pod start, the orchestrator's `secrets-store` CSI volume
+(`infra/k8s/orchestrator/deployment.yaml`) triggers the generic driver to delegate to
+ASCP on that node, which assumes the pod's IRSA role (`OrchestratorRole`, from
+irsa-roles.yaml) and fetches the objects listed in
+`infra/k8s/orchestrator/secret-provider-class.yaml` **live** — nothing is cached in the
+image or fetched at Helm-install time. Because that `SecretProviderClass` also declares
+`secretObjects`, the same mount step syncs those values into a real Kubernetes `Secret`
+(`orchestrator-secrets`), remapped to the key names (`POSTGRES_PASSWORD`,
+`GATEWAY_API_KEY`, etc.) the Deployment expects. The Deployment then loads that k8s
+`Secret` as env vars via `envFrom`, once, at container start — the app itself never calls
+Secrets Manager and never reads the mounted files directly.
+
+Caveat: env vars are fixed at container start. If a secret rotates in Secrets Manager
+afterward, the CSI driver can refresh the *mounted files* on its poll interval, but the
+derived k8s `Secret` and the pod's env vars will not update — a rotated secret only takes
+effect after the pod is restarted.
+
 ### 7. Apply the orchestrator manifests
 
 `infra/k8s/orchestrator/*.yaml` contain `__PLACEHOLDER__` tokens filled in

@@ -15,6 +15,15 @@ Parameters:
   KubernetesVersion:
     Type: String
     Default: "1.31"
+  ClusterAdminTrustedPrincipal:
+    Type: String
+    Default: "arn:aws:iam::206409480438:root"
+    Description: >
+      IAM principal (or "root" for the whole account) trusted to assume
+      ClusterAdminRole. With the account root, actual access is gated by
+      each user/role's own IAM policy needing sts:AssumeRole on
+      ClusterAdminRole's ARN — narrow this to specific role/user ARNs if
+      you'd rather trust only those principals directly.
 
 Resources:
   ClusterSecurityGroup:
@@ -52,6 +61,29 @@ Resources:
         EndpointPrivateAccess: true
         EndpointPublicAccess: true
 
+  # Explicit, version-controlled admin access instead of relying on EKS's
+  # implicit "cluster creator" grant, which binds to whatever principal
+  # happened to call CreateCluster (e.g. a CI/CD role), not to the team.
+  ClusterAdminRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${EnvironmentName}-eks-cluster-admin"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { AWS: !Ref ClusterAdminTrustedPrincipal }
+            Action: sts:AssumeRole
+
+  ClusterAdminAccessEntry:
+    Type: AWS::EKS::AccessEntry
+    Properties:
+      ClusterName: !Ref Cluster
+      PrincipalArn: !GetAtt ClusterAdminRole.Arn
+      AccessPolicies:
+        - PolicyArn: arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy
+          AccessScope: { Type: cluster }
+
   # IRSA: lets pods assume IAM roles via a ServiceAccount annotation instead
   # of node-wide instance-profile permissions. Thumbprint is Amazon Root CA1's
   # well-known SHA1 fingerprint, the same one eksctl/CDK register for every
@@ -80,6 +112,9 @@ Outputs:
   ClusterSharedSecurityGroupId:
     Value: !GetAtt Cluster.ClusterSecurityGroupId
     Export: { Name: !Sub "${AWS::StackName}-ClusterSharedSecurityGroupId" }
+  ClusterAdminRoleArn:
+    Value: !GetAtt ClusterAdminRole.Arn
+    Export: { Name: !Sub "${AWS::StackName}-ClusterAdminRoleArn" }
   OidcProviderArn:
     Value: !Ref OidcProvider
     Export: { Name: !Sub "${AWS::StackName}-OidcProviderArn" }
