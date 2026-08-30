@@ -1,0 +1,18 @@
+version: 0.2
+
+# Only sets the image on the existing Deployment (infra/k8s/orchestrator/deployment.yaml) —
+# it does not re-render the manifests' __PLACEHOLDER__ tokens, since those come from
+# CloudFormation outputs that don't change on an app deploy. See
+# infra/cloudformation/README.md step 7 if those need to change too.
+
+phases:
+  install:
+    commands:
+      - curl -sLO "https://dl.k8s.io/release/v1.31.0/bin/linux/amd64/kubectl"
+      - chmod +x kubectl && mv kubectl /usr/local/bin/kubectl
+  build:
+    commands:
+      - IMAGE_URI=$(cat image-uri.txt)
+      - aws eks update-kubeconfig --name "$EKS_CLUSTER_NAME" --region "$AWS_DEFAULT_REGION"
+      - kubectl set image "deployment/orchestrator" "orchestrator=$IMAGE_URI" -n "$ORCHESTRATOR_NAMESPACE"
+      - kubectl rollout status "deployment/orchestrator" -n "$ORCHESTRATOR_NAMESPACE" --timeout=180s

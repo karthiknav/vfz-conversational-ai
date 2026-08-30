@@ -1,0 +1,33 @@
+version: 0.2
+
+# Reads the orchestrator's Ingress ALB hostname live from the EKS API on
+# every run (infra/k8s/orchestrator/ingress.yaml) rather than caching it,
+# since recreating the Ingress would change the hostname. HTTP only, no
+# custom domain/ACM cert for this POC — see ingress.yaml's own note.
+
+phases:
+  install:
+    runtime-versions:
+      nodejs: 20
+    commands:
+      - curl -sLO "https://dl.k8s.io/release/v1.31.0/bin/linux/amd64/kubectl"
+      - chmod +x kubectl && mv kubectl /usr/local/bin/kubectl
+  pre_build:
+    commands:
+      - aws eks update-kubeconfig --name "$EKS_CLUSTER_NAME" --region "$AWS_DEFAULT_REGION"
+      - >
+        ALB_HOSTNAME=$(kubectl get ingress orchestrator -n "$ORCHESTRATOR_NAMESPACE"
+        -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+      - test -n "$ALB_HOSTNAME" || (echo "orchestrator Ingress has no ALB hostname yet" && exit 1)
+      - ORCHESTRATOR_BASE_URL="http://${ALB_HOSTNAME}"
+      - >
+        sed -i "s#<script type=\"module\" src=\"/src/main.js\"></script>#<script>window.ORCHESTRATOR_BASE_URL = \"${ORCHESTRATOR_BASE_URL}\";</script>\n  <script type=\"module\" src=\"/src/main.js\"></script>#"
+        services/ui/index.html
+  build:
+    commands:
+      - cd services/ui && npm ci && npm run build
+
+artifacts:
+  base-directory: services/ui/dist
+  files:
+    - "**/*"

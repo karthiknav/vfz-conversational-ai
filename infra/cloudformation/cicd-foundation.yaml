@@ -1,0 +1,53 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Shared CI/CD plumbing for the three pipeline stacks (cicd-pipeline-eks.yaml,
+  cicd-pipelines-ecs.yaml, cicd-pipeline-ui.yaml): one CodeStar Connection to
+  GitHub (federated OAuth — no PAT stored anywhere in this repo or its
+  pipelines) and one S3 bucket for CodePipeline/CodeBuild artifacts.
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: vfz-poc
+
+Resources:
+  # PROVIDER_TYPE GitHub creates the connection in PENDING status. It cannot
+  # be completed by CloudFormation — after this stack deploys, open it once
+  # in the console (CodePipeline > Settings > Connections > this connection >
+  # "Update pending connection") to install/authorize the AWS Connector for
+  # GitHub app against the target repo. This is the one-time handshake that
+  # replaces a stored GitHub token with short-lived, app-scoped OAuth.
+  GitHubConnection:
+    Type: AWS::CodeStarConnections::Connection
+    Properties:
+      ConnectionName: !Sub "${EnvironmentName}-github"
+      ProviderType: GitHub
+
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${EnvironmentName}-cicd-artifacts-${AWS::AccountId}-${AWS::Region}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-old-artifacts
+            Status: Enabled
+            ExpirationInDays: 30
+
+Outputs:
+  GitHubConnectionArn:
+    Value: !Ref GitHubConnection
+    Export: { Name: !Sub "${AWS::StackName}-GitHubConnectionArn" }
+  ArtifactBucketName:
+    Value: !Ref ArtifactBucket
+    Export: { Name: !Sub "${AWS::StackName}-ArtifactBucketName" }
+  ArtifactBucketArn:
+    Value: !GetAtt ArtifactBucket.Arn
+    Export: { Name: !Sub "${AWS::StackName}-ArtifactBucketArn" }

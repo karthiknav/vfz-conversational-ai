@@ -1,6 +1,8 @@
 # CloudFormation deployment — EKS orchestrator + ECS Fargate gateway-mcp + CloudFront/S3 UI
 
-Ten independent stacks, wired together via `Fn::ImportValue`. Each stack's
+Ten independent stacks, wired together via `Fn::ImportValue`, plus four more
+optional stacks (see the CI/CD steps below) that wire up CodePipeline/CodeBuild
+to build and deploy each service automatically on push. Each stack's
 `EnvironmentName` parameter defaults to `vfz-poc` — keep it consistent across
 all stacks in one environment, since several templates default their
 cross-stack `*StackName` parameters assuming CloudFormation stack names of
@@ -29,6 +31,12 @@ parameter **by** `gateway-services.yaml` itself, not by `app-secrets.yaml`.
    -- note the Ingress's ALB hostname --
 8. ui.yaml
    -- build UI with ORCHESTRATOR_BASE_URL injected, sync dist/ to the S3 bucket --
+
+-- optional, any time after 1-8 exist: CI/CD (push-to-deploy pipelines) --
+9. cicd-foundation.yaml
+   -- complete the GitHub connection handshake by hand, in the console --
+10. cicd-pipeline-eks.yaml, cicd-pipelines-ecs.yaml, cicd-pipeline-ui.yaml
+    (parallel, all depend only on 9 + the stacks above)
 ```
 
 All commands below are run from `infra/cloudformation/`. Stacks that create
@@ -277,6 +285,72 @@ aws s3 sync services/ui/dist s3://<ui UiBucketName output> --delete
 aws cloudfront create-invalidation --distribution-id <ui DistributionId output> --paths "/*"
 ```
 
+### 9. cicd-foundation
+
+Optional — only needed if you want push-to-deploy pipelines instead of
+running steps 4/8's manual `docker build`/`push`/`s3 sync` commands by
+hand on every change. No CloudFormation dependencies.
+
+```bash
+aws cloudformation deploy \
+  --stack-name vfz-cicd-foundation \
+  --template-file cicd-foundation.yaml \
+  --parameter-overrides EnvironmentName=vfz-poc \
+  --region us-east-1
+```
+
+This creates the GitHub connection in `PENDING` status — CloudFormation
+can't finish the handshake for you. Complete it once, by hand: CodePipeline
+console → Settings → Connections → `vfz-poc-github` → "Update pending
+connection" → install/authorize the AWS Connector for GitHub app against
+this repo. None of the pipelines in step 10 will run until this connection
+shows `AVAILABLE`.
+
+### 10. cicd-pipeline-eks, cicd-pipelines-ecs, cicd-pipeline-ui (parallel)
+
+Each depends on cicd-foundation (step 9) plus whichever of the ten base
+stacks it deploys to. All three need `RepoOwner` (the GitHub org/user that
+owns this repo — no default, since it can't be guessed).
+
+```bash
+aws cloudformation deploy \
+  --stack-name vfz-cicd-pipeline-eks \
+  --template-file cicd-pipeline-eks.yaml \
+  --parameter-overrides EnvironmentName=vfz-poc RepoOwner=<your-github-org-or-user> \
+  --capabilities CAPABILITY_NAMED_IAM \
+  --region us-east-1
+
+aws cloudformation deploy \
+  --stack-name vfz-cicd-pipelines-ecs \
+  --template-file cicd-pipelines-ecs.yaml \
+  --parameter-overrides EnvironmentName=vfz-poc RepoOwner=<your-github-org-or-user> \
+  --capabilities CAPABILITY_NAMED_IAM \
+  --region us-east-1
+
+aws cloudformation deploy \
+  --stack-name vfz-cicd-pipeline-ui \
+  --template-file cicd-pipeline-ui.yaml \
+  --parameter-overrides EnvironmentName=vfz-poc RepoOwner=<your-github-org-or-user> \
+  --capabilities CAPABILITY_NAMED_IAM \
+  --region us-east-1
+```
+
+All three assume the ten base stacks already exist under their default
+names (`vfz-network`, `vfz-ecr`, `vfz-eks-cluster`, `vfz-gateway-ecs-cluster`,
+`vfz-gateway-services`, `vfz-ui`, …) — override the `*StackName` parameters
+if you deployed any of them under different names. `vfz-gateway-services`
+specifically must already export `GatewayServiceName`/
+`BluemarbleServiceName`/`SalesforceServiceName` for `cicd-pipelines-ecs.yaml`
+to import — redeploy that stack first if it predates this addition.
+
+Once all three are `AVAILABLE`, a push to `main` touching
+`services/orchestrator/**` or `infra/k8s/orchestrator/**` triggers the EKS
+pipeline; touching `services/gateway-mcp/**`, `services/mock-bluemarble/**`,
+or `services/mock-salesforce/**` triggers the matching ECS pipeline;
+touching `services/ui/**` triggers the UI pipeline — each is scoped to its
+own directory (CodePipeline V2 push-trigger path filters), so one service's
+change never redeploys another.
+
 ## Stack components
 
 ### network.yaml
@@ -381,9 +455,6 @@ plane with it.
 Three ECS Fargate services in the gateway-private subnets, plus the
 plumbing between them:
 
-- **Cloud Map namespace** (`gateway.internal`) with A-record services for
-  `mock-bluemarble` and `mock-salesforce` — private DNS discovery used only
-  by gateway-mcp, never exposed to EKS.
 - **TaskExecutionRole** (shared) — pulls images and reads the DB secret and
   gateway API key secret for injection as container secrets.
 - **gateway-mcp**: task role carries an explicit `Deny` on
@@ -405,6 +476,50 @@ plumbing between them:
   `http://<GatewayAlb DNS name>/mcp`, consumed by the orchestrator's k8s
   Deployment as `GATEWAY_MCP_URL`. HTTP only for this POC — no custom
   domain or ACM cert; add both before treating this as production.
+
+#### Cloud Map service discovery
+
+`Namespace` is an `AWS::ServiceDiscovery::PrivateDnsNamespace`
+(`gateway.internal`), which Cloud Map backs with a Route 53 **private
+hosted zone** associated with this VPC. `BluemarbleDiscovery` and
+`SalesforceDiscovery` are `AWS::ServiceDiscovery::Service` resources with
+`DnsRecords: [{Type: A}]` — each becomes one record set in that zone
+(`mock-bluemarble.gateway.internal`, `mock-salesforce.gateway.internal`),
+but empty until something registers an instance.
+
+That "something" is the `ServiceRegistries` property on the
+`BluemarbleService`/`SalesforceService` `AWS::ECS::Service` resources
+below. As tasks start, stop, or get replaced, ECS calls Cloud Map's
+`RegisterInstance`/`DeregisterInstance` API on your behalf, adding or
+removing that task's private IP as an A-record value — no polling, no
+sidecar. `TTL: 10` keeps resolver caching short, since those IPs churn on
+every deploy or scaling event.
+
+**The "load balancing" this gives you is DNS round-robin, not a real load
+balancer.** `DnsConfig` here doesn't set `RoutingPolicy`, which defaults to
+`MULTIVALUE`: Route 53 returns up to 8 healthy instance IPs per query, and
+whichever resolver/SDK asked picks one — there's no connection draining,
+no L7 routing, no sticky sessions, and no active traffic shifting beyond
+Route 53 dropping an IP once ECS deregisters that instance. In practice
+this doesn't matter today: both mocks run `DesiredCount: 1`, so there's
+only ever one IP behind each name.
+
+This is exactly why gateway-mcp itself is wired differently one section up
+— it fronts a real `GatewayAlb`/`GatewayTargetGroup` with health checks,
+because it's the public entry point and needs real L7 load balancing; the
+two mocks get the cheaper Cloud Map option because they're private,
+low-stakes, single-task callees with no such requirement.
+
+Cloud Map itself isn't ECS-specific — EC2, Lambda, and even non-AWS apps
+can register through its plain API, and App Mesh/ECS Service Connect are
+both built on top of it. (A single EKS cluster like this one's doesn't
+need it at all: Kubernetes has its own built-in DNS-based service
+discovery via CoreDNS, which is why `infra/k8s/orchestrator/service.yaml`
+doesn't touch Cloud Map.) If either mock ever needed multiple tasks in a
+real production setting, **ECS Service Connect** — an Envoy proxy layered
+on top of this same Cloud Map namespace — would be the first upgrade to
+reach for: it adds real client-side load balancing and near-instant
+unhealthy-task removal without standing up a whole new ALB per service.
 
 ### data.yaml
 
@@ -475,6 +590,58 @@ needs the orchestrator's Ingress ALB hostname baked in.
 - `UiBucketPolicy` — grants `cloudfront.amazonaws.com` `s3:GetObject`,
   conditioned on `AWS:SourceArn` matching this specific distribution.
 
+### cicd-foundation.yaml
+
+Shared CI/CD plumbing: one CodeStar Connection to GitHub (a GitHub App
+OAuth handshake, completed once by hand — no PAT stored anywhere) and one
+S3 bucket for CodePipeline/CodeBuild artifacts, shared by all three
+pipeline stacks below.
+
+### cicd-pipeline-eks.yaml
+
+The orchestrator's pipeline — the only one deploying to EKS instead of
+ECS. Triggered only by pushes to `services/orchestrator/**` or
+`infra/k8s/orchestrator/**`. Build stage builds + pushes the image to
+ECR; Deploy stage is a CodeBuild project that runs `kubectl set image` +
+`kubectl rollout status` against the existing Deployment — it does not
+re-render `infra/k8s/orchestrator/*.yaml`'s `__PLACEHOLDER__` tokens,
+since those only change when the surrounding CloudFormation stacks
+change (a provisioning-time concern — see step 7 above — not a per-commit
+one). The deploy role gets an `AWS::EKS::AccessEntry` scoped to the
+`orchestrator` namespace only (`AmazonEKSEditPolicy`, namespace-scoped,
+not cluster-admin) — IAM permissions alone aren't enough to call the k8s
+API under `AuthenticationMode: API_AND_CONFIG_MAP`.
+
+### cicd-pipelines-ecs.yaml
+
+Three independent pipelines bundled in one stack (mirroring how
+gateway-services.yaml bundles the three ECS services themselves):
+gateway-mcp, mock-bluemarble, mock-salesforce — each triggered only by
+pushes to its own `services/<name>/` directory. Each Build stage builds +
+pushes to ECR and writes an `imagedefinitions.json`; each Deploy stage is
+its own CodeBuild project that scripts the ECS update directly —
+`describe-task-definition`, swap the one container's image with `jq`,
+`register-task-definition`, `update-service`, then `wait
+services-stable` — rather than using CodePipeline's native `ECS` deploy
+action. Same rolling-update behavior either way; scripting it means the
+stage can grow custom health gates or rollback logic later without
+switching to CodeDeploy blue/green (the other alternative — a better fit
+for gateway-mcp specifically, since it's the one service with an ALB in
+front of it; the mocks have neither public traffic nor a load balancer to
+shift, so blue/green would add infra for no benefit there).
+
+### cicd-pipeline-ui.yaml
+
+Triggered only by pushes to `services/ui/**`. Build stage reads the
+orchestrator's Ingress ALB hostname live via `kubectl get ingress`
+(read-only `AmazonEKSViewPolicy` access entry, scoped to the
+`orchestrator` namespace — same reasoning as cicd-pipeline-eks.yaml's
+access entry, just view instead of edit), injects it into
+`services/ui/index.html` as `window.ORCHESTRATOR_BASE_URL`, then runs
+`npm run build`. Deploy stage syncs `dist/` to the UI bucket and
+invalidates CloudFront. Deliberately re-reads the ALB hostname on every
+run instead of caching it, since recreating the Ingress would change it.
+
 ## Verification
 
 See the "Verification" section of the approved plan
@@ -483,3 +650,31 @@ health checks, checkpointer persistence across a pod restart, the
 `scripts/mcp_smoke_test.py` run against the deployed orchestrator, mock
 unreachability from outside the gateway ECS cluster, and an end-to-end
 chat + approve flow through the CloudFront URL.
+
+## CI/CD notes and gaps to close before production
+
+Auth to AWS never uses a stored access key across any of the four CI/CD
+stacks (see steps 9-10 and their stack-component entries above): GitHub
+access goes through a CodeStar Connection (a GitHub App OAuth handshake,
+completed once by hand), and every pipeline/build/deploy role is a normal
+IAM role assumed by the AWS service itself (CodePipeline/CodeBuild),
+scoped to exactly what that stage does. What's still missing before this
+would hold up as a production setup:
+
+- **No rollback automation.** ECS deploys get standard rolling-update
+  behavior from `UpdateService`, but nothing here watches for a bad
+  rollout and reverts it. The orchestrator's `kubectl rollout status`
+  will at least fail the pipeline (and leave the previous ReplicaSet
+  running) if the new pods never become ready — that's a stop, not an
+  automatic rollback.
+- **No test/lint stage.** These pipelines go straight from build to
+  deploy. Add a stage (or a step in the build buildspec) running each
+  service's test suite before the image is pushed.
+- **`latest` tag still gets overwritten on every push**, alongside the
+  immutable short-SHA tag each pipeline actually deploys — keep it only if
+  something still depends on it; drop it once nothing does.
+- **Single environment.** There's no staging gate — every push to `main`
+  that touches a service's directory deploys straight to `vfz-poc`. Adding
+  a second environment means parameterizing `BranchName`/`EnvironmentName`
+  per env and, for a real approval gate, adding a manual-approval stage
+  before Deploy.

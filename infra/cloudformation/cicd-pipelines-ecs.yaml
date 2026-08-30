@@ -1,0 +1,483 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Three independent CodePipelines, one per ECS Fargate service on the
+  gateway cluster (gateway-mcp, mock-bluemarble, mock-salesforce) — bundled
+  into a single stack the way gateway-services.yaml bundles the three ECS
+  services themselves, but each pipeline only fires on pushes touching its
+  own service directory (CodePipeline V2 push-trigger path filters). Build
+  stages build + push to ECR and emit imagedefinitions.json; Deploy stages
+  are CodeBuild projects that script the ECS update themselves
+  (register-task-definition with the new image + update-service + wait
+  services-stable) rather than using CodePipeline's native "ECS" deploy
+  action — same rolling-update behavior, but as an explicit stage we can
+  extend later (extra health gates, custom rollback) without switching to
+  CodeDeploy blue/green.
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: vfz-poc
+  CicdFoundationStackName:
+    Type: String
+    Default: vfz-cicd-foundation
+  EcrStackName:
+    Type: String
+    Default: vfz-ecr
+  GatewayEcsClusterStackName:
+    Type: String
+    Default: vfz-gateway-ecs-cluster
+  GatewayServicesStackName:
+    Type: String
+    Default: vfz-gateway-services
+  RepoOwner:
+    Type: String
+    Description: GitHub org/user that owns this repo (e.g. "your-org").
+  RepoName:
+    Type: String
+    Default: vfz-conversational-ai
+  BranchName:
+    Type: String
+    Default: main
+
+Resources:
+  # ----------------------------------------------------- shared pipeline role
+  # One role for all three pipelines: same connection, same artifact bucket,
+  # same ECS-deploy action permissions (scoped by Condition, not per-service
+  # Resource, since imagedefinitions-based deploy actions register task defs
+  # dynamically — see the iam:PassRole condition below).
+  PipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${EnvironmentName}-gateway-cicd-pipeline-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - { Effect: Allow, Principal: { Service: codepipeline.amazonaws.com }, Action: sts:AssumeRole }
+      Policies:
+        - PolicyName: PipelinePermissions
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: codestar-connections:UseConnection
+                Resource: !ImportValue { "Fn::Sub": "${CicdFoundationStackName}-GitHubConnectionArn" }
+              - Effect: Allow
+                Action: ["codebuild:StartBuild", "codebuild:BatchGetBuilds"]
+                Resource:
+                  - !GetAtt GatewayBuildProject.Arn
+                  - !GetAtt BluemarbleBuildProject.Arn
+                  - !GetAtt SalesforceBuildProject.Arn
+                  - !GetAtt GatewayDeployProject.Arn
+                  - !GetAtt BluemarbleDeployProject.Arn
+                  - !GetAtt SalesforceDeployProject.Arn
+              - Effect: Allow
+                Action: ["s3:GetObject", "s3:PutObject", "s3:GetBucketVersioning"]
+                Resource:
+                  - !ImportValue { "Fn::Sub": "${CicdFoundationStackName}-ArtifactBucketArn" }
+                  - !Sub
+                    - "${BucketArn}/*"
+                    - BucketArn: !ImportValue { "Fn::Sub": "${CicdFoundationStackName}-ArtifactBucketArn" }
+
+  # ==================================================================
+  # gateway-mcp
+  # ==================================================================
+  GatewayBuildLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: { LogGroupName: !Sub "/codebuild/${EnvironmentName}-gateway-mcp-build", RetentionInDays: 14 }
+
+  GatewayBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${EnvironmentName}-gateway-mcp-cicd-build-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - { Effect: Allow, Principal: { Service: codebuild.amazonaws.com }, Action: sts:AssumeRole }
+      Policies:
+        - PolicyName: BuildPermissions
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - { Effect: Allow, Action: ["logs:CreateLogStream", "logs:PutLogEvents"], Resource: !GetAtt GatewayBuildLogGroup.Arn }
+              - { Effect: Allow, Action: ecr:GetAuthorizationToken, Resource: "*" }
+              - Effect: Allow
+                Action: [ecr:BatchCheckLayerAvailability, ecr:InitiateLayerUpload, ecr:UploadLayerPart, ecr:CompleteLayerUpload, ecr:PutImage, ecr:BatchGetImage]
+                Resource: !Sub "arn:aws:ecr:${AWS::Region}:${AWS::AccountId}:repository/${EnvironmentName}/gateway-mcp"
+
+  GatewayBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub "${EnvironmentName}-gateway-mcp-build"
+      ServiceRole: !GetAtt GatewayBuildRole.Arn
+      Artifacts: { Type: CODEPIPELINE }
+      Source: { Type: CODEPIPELINE, BuildSpec: services/gateway-mcp/buildspec.yml }
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:7.0
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - { Name: ECR_REPO_URI, Value: !ImportValue { "Fn::Sub": "${EcrStackName}-GatewayMcpRepoUri" } }
+          - { Name: CONTAINER_NAME, Value: gateway-mcp }
+          - { Name: AWS_DEFAULT_REGION, Value: !Ref AWS::Region }
+      LogsConfig: { CloudWatchLogs: { GroupName: !Ref GatewayBuildLogGroup, Status: ENABLED } }
+
+  GatewayDeployLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: { LogGroupName: !Sub "/codebuild/${EnvironmentName}-gateway-mcp-deploy", RetentionInDays: 14 }
+
+  GatewayDeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${EnvironmentName}-gateway-mcp-cicd-deploy-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - { Effect: Allow, Principal: { Service: codebuild.amazonaws.com }, Action: sts:AssumeRole }
+      Policies:
+        - PolicyName: DeployPermissions
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - { Effect: Allow, Action: ["logs:CreateLogStream", "logs:PutLogEvents"], Resource: !GetAtt GatewayDeployLogGroup.Arn }
+              # RegisterTaskDefinition/DescribeTaskDefinition don't support resource-level
+              # permissions (the task def ARN doesn't exist yet at register time) — AWS
+              # requires Resource "*" for both.
+              - { Effect: Allow, Action: ["ecs:DescribeTaskDefinition", "ecs:RegisterTaskDefinition"], Resource: "*" }
+              - Effect: Allow
+                Action: ["ecs:DescribeServices", "ecs:UpdateService"]
+                Resource: !Sub
+                  - "arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:service/${ClusterName}/${ServiceName}"
+                  - ClusterName: !ImportValue { "Fn::Sub": "${GatewayEcsClusterStackName}-ClusterName" }
+                    ServiceName: !ImportValue { "Fn::Sub": "${GatewayServicesStackName}-GatewayServiceName" }
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource: "*"
+                Condition: { StringEquals: { "iam:PassedToService": "ecs-tasks.amazonaws.com" } }
+
+  GatewayDeployProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub "${EnvironmentName}-gateway-mcp-deploy"
+      ServiceRole: !GetAtt GatewayDeployRole.Arn
+      Artifacts: { Type: CODEPIPELINE }
+      Source: { Type: CODEPIPELINE, BuildSpec: services/gateway-mcp/deployspec.yml }
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:7.0
+        EnvironmentVariables:
+          - { Name: TASK_DEFINITION_FAMILY, Value: !Sub "${EnvironmentName}-gateway-mcp" }
+          - { Name: CONTAINER_NAME, Value: gateway-mcp }
+          - { Name: ECS_CLUSTER_NAME, Value: !ImportValue { "Fn::Sub": "${GatewayEcsClusterStackName}-ClusterName" } }
+          - { Name: ECS_SERVICE_NAME, Value: !ImportValue { "Fn::Sub": "${GatewayServicesStackName}-GatewayServiceName" } }
+          - { Name: AWS_DEFAULT_REGION, Value: !Ref AWS::Region }
+      LogsConfig: { CloudWatchLogs: { GroupName: !Ref GatewayDeployLogGroup, Status: ENABLED } }
+
+  GatewayPipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: !Sub "${EnvironmentName}-gateway-mcp-pipeline"
+      PipelineType: V2
+      RoleArn: !GetAtt PipelineRole.Arn
+      ArtifactStore: { Type: S3, Location: !ImportValue { "Fn::Sub": "${CicdFoundationStackName}-ArtifactBucketName" } }
+      Triggers:
+        - ProviderType: CodeStarSourceConnection
+          GitConfiguration:
+            SourceActionName: Source
+            Push:
+              - Branches: { Includes: [!Ref BranchName] }
+                FilePaths: { Includes: ["services/gateway-mcp/**"] }
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: Source
+              ActionTypeId: { Category: Source, Owner: AWS, Provider: CodeStarSourceConnection, Version: "1" }
+              Configuration:
+                ConnectionArn: !ImportValue { "Fn::Sub": "${CicdFoundationStackName}-GitHubConnectionArn" }
+                FullRepositoryId: !Sub "${RepoOwner}/${RepoName}"
+                BranchName: !Ref BranchName
+                DetectChanges: "false"
+              OutputArtifacts: [{ Name: SourceOutput }]
+        - Name: Build
+          Actions:
+            - Name: Build
+              ActionTypeId: { Category: Build, Owner: AWS, Provider: CodeBuild, Version: "1" }
+              Configuration: { ProjectName: !Ref GatewayBuildProject }
+              InputArtifacts: [{ Name: SourceOutput }]
+              OutputArtifacts: [{ Name: BuildOutput }]
+        - Name: Deploy
+          Actions:
+            - Name: Deploy
+              ActionTypeId: { Category: Build, Owner: AWS, Provider: CodeBuild, Version: "1" }
+              Configuration: { ProjectName: !Ref GatewayDeployProject }
+              InputArtifacts: [{ Name: BuildOutput }]
+
+  # ==================================================================
+  # mock-bluemarble
+  # ==================================================================
+  BluemarbleBuildLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: { LogGroupName: !Sub "/codebuild/${EnvironmentName}-mock-bluemarble-build", RetentionInDays: 14 }
+
+  BluemarbleBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${EnvironmentName}-mock-bluemarble-cicd-build-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - { Effect: Allow, Principal: { Service: codebuild.amazonaws.com }, Action: sts:AssumeRole }
+      Policies:
+        - PolicyName: BuildPermissions
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - { Effect: Allow, Action: ["logs:CreateLogStream", "logs:PutLogEvents"], Resource: !GetAtt BluemarbleBuildLogGroup.Arn }
+              - { Effect: Allow, Action: ecr:GetAuthorizationToken, Resource: "*" }
+              - Effect: Allow
+                Action: [ecr:BatchCheckLayerAvailability, ecr:InitiateLayerUpload, ecr:UploadLayerPart, ecr:CompleteLayerUpload, ecr:PutImage, ecr:BatchGetImage]
+                Resource: !Sub "arn:aws:ecr:${AWS::Region}:${AWS::AccountId}:repository/${EnvironmentName}/mock-bluemarble"
+
+  BluemarbleBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub "${EnvironmentName}-mock-bluemarble-build"
+      ServiceRole: !GetAtt BluemarbleBuildRole.Arn
+      Artifacts: { Type: CODEPIPELINE }
+      Source: { Type: CODEPIPELINE, BuildSpec: services/mock-bluemarble/buildspec.yml }
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:7.0
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - { Name: ECR_REPO_URI, Value: !ImportValue { "Fn::Sub": "${EcrStackName}-MockBluemarbleRepoUri" } }
+          - { Name: CONTAINER_NAME, Value: mock-bluemarble }
+          - { Name: AWS_DEFAULT_REGION, Value: !Ref AWS::Region }
+      LogsConfig: { CloudWatchLogs: { GroupName: !Ref BluemarbleBuildLogGroup, Status: ENABLED } }
+
+  BluemarbleDeployLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: { LogGroupName: !Sub "/codebuild/${EnvironmentName}-mock-bluemarble-deploy", RetentionInDays: 14 }
+
+  BluemarbleDeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${EnvironmentName}-mock-bluemarble-cicd-deploy-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - { Effect: Allow, Principal: { Service: codebuild.amazonaws.com }, Action: sts:AssumeRole }
+      Policies:
+        - PolicyName: DeployPermissions
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - { Effect: Allow, Action: ["logs:CreateLogStream", "logs:PutLogEvents"], Resource: !GetAtt BluemarbleDeployLogGroup.Arn }
+              - { Effect: Allow, Action: ["ecs:DescribeTaskDefinition", "ecs:RegisterTaskDefinition"], Resource: "*" }
+              - Effect: Allow
+                Action: ["ecs:DescribeServices", "ecs:UpdateService"]
+                Resource: !Sub
+                  - "arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:service/${ClusterName}/${ServiceName}"
+                  - ClusterName: !ImportValue { "Fn::Sub": "${GatewayEcsClusterStackName}-ClusterName" }
+                    ServiceName: !ImportValue { "Fn::Sub": "${GatewayServicesStackName}-BluemarbleServiceName" }
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource: "*"
+                Condition: { StringEquals: { "iam:PassedToService": "ecs-tasks.amazonaws.com" } }
+
+  BluemarbleDeployProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub "${EnvironmentName}-mock-bluemarble-deploy"
+      ServiceRole: !GetAtt BluemarbleDeployRole.Arn
+      Artifacts: { Type: CODEPIPELINE }
+      Source: { Type: CODEPIPELINE, BuildSpec: services/mock-bluemarble/deployspec.yml }
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:7.0
+        EnvironmentVariables:
+          - { Name: TASK_DEFINITION_FAMILY, Value: !Sub "${EnvironmentName}-mock-bluemarble" }
+          - { Name: CONTAINER_NAME, Value: mock-bluemarble }
+          - { Name: ECS_CLUSTER_NAME, Value: !ImportValue { "Fn::Sub": "${GatewayEcsClusterStackName}-ClusterName" } }
+          - { Name: ECS_SERVICE_NAME, Value: !ImportValue { "Fn::Sub": "${GatewayServicesStackName}-BluemarbleServiceName" } }
+          - { Name: AWS_DEFAULT_REGION, Value: !Ref AWS::Region }
+      LogsConfig: { CloudWatchLogs: { GroupName: !Ref BluemarbleDeployLogGroup, Status: ENABLED } }
+
+  BluemarblePipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: !Sub "${EnvironmentName}-mock-bluemarble-pipeline"
+      PipelineType: V2
+      RoleArn: !GetAtt PipelineRole.Arn
+      ArtifactStore: { Type: S3, Location: !ImportValue { "Fn::Sub": "${CicdFoundationStackName}-ArtifactBucketName" } }
+      Triggers:
+        - ProviderType: CodeStarSourceConnection
+          GitConfiguration:
+            SourceActionName: Source
+            Push:
+              - Branches: { Includes: [!Ref BranchName] }
+                FilePaths: { Includes: ["services/mock-bluemarble/**"] }
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: Source
+              ActionTypeId: { Category: Source, Owner: AWS, Provider: CodeStarSourceConnection, Version: "1" }
+              Configuration:
+                ConnectionArn: !ImportValue { "Fn::Sub": "${CicdFoundationStackName}-GitHubConnectionArn" }
+                FullRepositoryId: !Sub "${RepoOwner}/${RepoName}"
+                BranchName: !Ref BranchName
+                DetectChanges: "false"
+              OutputArtifacts: [{ Name: SourceOutput }]
+        - Name: Build
+          Actions:
+            - Name: Build
+              ActionTypeId: { Category: Build, Owner: AWS, Provider: CodeBuild, Version: "1" }
+              Configuration: { ProjectName: !Ref BluemarbleBuildProject }
+              InputArtifacts: [{ Name: SourceOutput }]
+              OutputArtifacts: [{ Name: BuildOutput }]
+        - Name: Deploy
+          Actions:
+            - Name: Deploy
+              ActionTypeId: { Category: Build, Owner: AWS, Provider: CodeBuild, Version: "1" }
+              Configuration: { ProjectName: !Ref BluemarbleDeployProject }
+              InputArtifacts: [{ Name: BuildOutput }]
+
+  # ==================================================================
+  # mock-salesforce
+  # ==================================================================
+  SalesforceBuildLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: { LogGroupName: !Sub "/codebuild/${EnvironmentName}-mock-salesforce-build", RetentionInDays: 14 }
+
+  SalesforceBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${EnvironmentName}-mock-salesforce-cicd-build-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - { Effect: Allow, Principal: { Service: codebuild.amazonaws.com }, Action: sts:AssumeRole }
+      Policies:
+        - PolicyName: BuildPermissions
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - { Effect: Allow, Action: ["logs:CreateLogStream", "logs:PutLogEvents"], Resource: !GetAtt SalesforceBuildLogGroup.Arn }
+              - { Effect: Allow, Action: ecr:GetAuthorizationToken, Resource: "*" }
+              - Effect: Allow
+                Action: [ecr:BatchCheckLayerAvailability, ecr:InitiateLayerUpload, ecr:UploadLayerPart, ecr:CompleteLayerUpload, ecr:PutImage, ecr:BatchGetImage]
+                Resource: !Sub "arn:aws:ecr:${AWS::Region}:${AWS::AccountId}:repository/${EnvironmentName}/mock-salesforce"
+
+  SalesforceBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub "${EnvironmentName}-mock-salesforce-build"
+      ServiceRole: !GetAtt SalesforceBuildRole.Arn
+      Artifacts: { Type: CODEPIPELINE }
+      Source: { Type: CODEPIPELINE, BuildSpec: services/mock-salesforce/buildspec.yml }
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:7.0
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - { Name: ECR_REPO_URI, Value: !ImportValue { "Fn::Sub": "${EcrStackName}-MockSalesforceRepoUri" } }
+          - { Name: CONTAINER_NAME, Value: mock-salesforce }
+          - { Name: AWS_DEFAULT_REGION, Value: !Ref AWS::Region }
+      LogsConfig: { CloudWatchLogs: { GroupName: !Ref SalesforceBuildLogGroup, Status: ENABLED } }
+
+  SalesforceDeployLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: { LogGroupName: !Sub "/codebuild/${EnvironmentName}-mock-salesforce-deploy", RetentionInDays: 14 }
+
+  SalesforceDeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${EnvironmentName}-mock-salesforce-cicd-deploy-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - { Effect: Allow, Principal: { Service: codebuild.amazonaws.com }, Action: sts:AssumeRole }
+      Policies:
+        - PolicyName: DeployPermissions
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - { Effect: Allow, Action: ["logs:CreateLogStream", "logs:PutLogEvents"], Resource: !GetAtt SalesforceDeployLogGroup.Arn }
+              - { Effect: Allow, Action: ["ecs:DescribeTaskDefinition", "ecs:RegisterTaskDefinition"], Resource: "*" }
+              - Effect: Allow
+                Action: ["ecs:DescribeServices", "ecs:UpdateService"]
+                Resource: !Sub
+                  - "arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:service/${ClusterName}/${ServiceName}"
+                  - ClusterName: !ImportValue { "Fn::Sub": "${GatewayEcsClusterStackName}-ClusterName" }
+                    ServiceName: !ImportValue { "Fn::Sub": "${GatewayServicesStackName}-SalesforceServiceName" }
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource: "*"
+                Condition: { StringEquals: { "iam:PassedToService": "ecs-tasks.amazonaws.com" } }
+
+  SalesforceDeployProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub "${EnvironmentName}-mock-salesforce-deploy"
+      ServiceRole: !GetAtt SalesforceDeployRole.Arn
+      Artifacts: { Type: CODEPIPELINE }
+      Source: { Type: CODEPIPELINE, BuildSpec: services/mock-salesforce/deployspec.yml }
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:7.0
+        EnvironmentVariables:
+          - { Name: TASK_DEFINITION_FAMILY, Value: !Sub "${EnvironmentName}-mock-salesforce" }
+          - { Name: CONTAINER_NAME, Value: mock-salesforce }
+          - { Name: ECS_CLUSTER_NAME, Value: !ImportValue { "Fn::Sub": "${GatewayEcsClusterStackName}-ClusterName" } }
+          - { Name: ECS_SERVICE_NAME, Value: !ImportValue { "Fn::Sub": "${GatewayServicesStackName}-SalesforceServiceName" } }
+          - { Name: AWS_DEFAULT_REGION, Value: !Ref AWS::Region }
+      LogsConfig: { CloudWatchLogs: { GroupName: !Ref SalesforceDeployLogGroup, Status: ENABLED } }
+
+  SalesforcePipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: !Sub "${EnvironmentName}-mock-salesforce-pipeline"
+      PipelineType: V2
+      RoleArn: !GetAtt PipelineRole.Arn
+      ArtifactStore: { Type: S3, Location: !ImportValue { "Fn::Sub": "${CicdFoundationStackName}-ArtifactBucketName" } }
+      Triggers:
+        - ProviderType: CodeStarSourceConnection
+          GitConfiguration:
+            SourceActionName: Source
+            Push:
+              - Branches: { Includes: [!Ref BranchName] }
+                FilePaths: { Includes: ["services/mock-salesforce/**"] }
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: Source
+              ActionTypeId: { Category: Source, Owner: AWS, Provider: CodeStarSourceConnection, Version: "1" }
+              Configuration:
+                ConnectionArn: !ImportValue { "Fn::Sub": "${CicdFoundationStackName}-GitHubConnectionArn" }
+                FullRepositoryId: !Sub "${RepoOwner}/${RepoName}"
+                BranchName: !Ref BranchName
+                DetectChanges: "false"
+              OutputArtifacts: [{ Name: SourceOutput }]
+        - Name: Build
+          Actions:
+            - Name: Build
+              ActionTypeId: { Category: Build, Owner: AWS, Provider: CodeBuild, Version: "1" }
+              Configuration: { ProjectName: !Ref SalesforceBuildProject }
+              InputArtifacts: [{ Name: SourceOutput }]
+              OutputArtifacts: [{ Name: BuildOutput }]
+        - Name: Deploy
+          Actions:
+            - Name: Deploy
+              ActionTypeId: { Category: Build, Owner: AWS, Provider: CodeBuild, Version: "1" }
+              Configuration: { ProjectName: !Ref SalesforceDeployProject }
+              InputArtifacts: [{ Name: BuildOutput }]
+
+Outputs:
+  GatewayPipelineName: { Value: !Ref GatewayPipeline, Export: { Name: !Sub "${AWS::StackName}-GatewayPipelineName" } }
+  BluemarblePipelineName: { Value: !Ref BluemarblePipeline, Export: { Name: !Sub "${AWS::StackName}-BluemarblePipelineName" } }
+  SalesforcePipelineName: { Value: !Ref SalesforcePipeline, Export: { Name: !Sub "${AWS::StackName}-SalesforcePipelineName" } }

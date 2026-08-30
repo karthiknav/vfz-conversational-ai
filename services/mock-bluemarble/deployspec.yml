@@ -1,0 +1,25 @@
+version: 0.2
+
+# Scripted ECS deploy — see services/gateway-mcp/deployspec.yml for the
+# rationale (replaces CodePipeline's native "ECS" deploy action).
+
+phases:
+  build:
+    commands:
+      - IMAGE_URI=$(jq -r '.[0].imageUri' imagedefinitions.json)
+      - >
+        CURRENT_TASK_DEF=$(aws ecs describe-task-definition
+        --task-definition "$TASK_DEFINITION_FAMILY" --query 'taskDefinition' --output json)
+      - >
+        NEW_TASK_DEF=$(echo "$CURRENT_TASK_DEF" | jq --arg IMAGE "$IMAGE_URI" --arg NAME "$CONTAINER_NAME" '
+        .containerDefinitions |= map(if .name == $NAME then .image = $IMAGE else . end)
+        | {family, taskRoleArn, executionRoleArn, networkMode, containerDefinitions, volumes, placementConstraints, requiresCompatibilities, cpu, memory}
+        | with_entries(select(.value != null))
+        ')
+      - >
+        NEW_TASK_DEF_ARN=$(aws ecs register-task-definition --cli-input-json "$NEW_TASK_DEF"
+        --query 'taskDefinition.taskDefinitionArn' --output text)
+      - >
+        aws ecs update-service --cluster "$ECS_CLUSTER_NAME" --service "$ECS_SERVICE_NAME"
+        --task-definition "$NEW_TASK_DEF_ARN" >/dev/null
+      - aws ecs wait services-stable --cluster "$ECS_CLUSTER_NAME" --services "$ECS_SERVICE_NAME"

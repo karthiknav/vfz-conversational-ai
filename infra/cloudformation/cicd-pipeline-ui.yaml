@@ -1,0 +1,212 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  CodePipeline for the static chat UI. Only fires on pushes to
+  `services/ui/**`. Build stage reads the orchestrator's Ingress ALB
+  hostname live from the EKS API (kubectl get ingress), injects it into
+  index.html as window.ORCHESTRATOR_BASE_URL, then runs `npm run build`.
+  Deploy stage syncs dist/ to the UI's S3 bucket and invalidates
+  CloudFront. Deliberately re-reads the ALB hostname on every run instead
+  of caching it, since an Ingress recreation would change it.
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: vfz-poc
+  CicdFoundationStackName:
+    Type: String
+    Default: vfz-cicd-foundation
+  EksClusterStackName:
+    Type: String
+    Default: vfz-eks-cluster
+  UiStackName:
+    Type: String
+    Default: vfz-ui
+  RepoOwner:
+    Type: String
+    Description: GitHub org/user that owns this repo (e.g. "your-org").
+  RepoName:
+    Type: String
+    Default: vfz-conversational-ai
+  BranchName:
+    Type: String
+    Default: main
+  OrchestratorNamespace:
+    Type: String
+    Default: orchestrator
+
+Resources:
+  # --------------------------------------------------------------- build
+  BuildLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: { LogGroupName: !Sub "/codebuild/${EnvironmentName}-ui-build", RetentionInDays: 14 }
+
+  BuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${EnvironmentName}-ui-cicd-build-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - { Effect: Allow, Principal: { Service: codebuild.amazonaws.com }, Action: sts:AssumeRole }
+      Policies:
+        - PolicyName: BuildPermissions
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - { Effect: Allow, Action: ["logs:CreateLogStream", "logs:PutLogEvents"], Resource: !GetAtt BuildLogGroup.Arn }
+              - Effect: Allow
+                Action: eks:DescribeCluster
+                Resource: !Sub
+                  - "arn:aws:eks:${AWS::Region}:${AWS::AccountId}:cluster/${ClusterName}"
+                  - ClusterName: !ImportValue { "Fn::Sub": "${EksClusterStackName}-ClusterName" }
+
+  # Read-only k8s grant — this role only needs to `kubectl get ingress`, not
+  # edit anything, unlike cicd-pipeline-eks.yaml's DeployAccessEntry.
+  BuildAccessEntry:
+    Type: AWS::EKS::AccessEntry
+    Properties:
+      ClusterName: !ImportValue { "Fn::Sub": "${EksClusterStackName}-ClusterName" }
+      PrincipalArn: !GetAtt BuildRole.Arn
+      AccessPolicies:
+        - PolicyArn: arn:aws:eks::aws:cluster-access-policy/AmazonEKSViewPolicy
+          AccessScope: { Type: namespace, Namespaces: [!Ref OrchestratorNamespace] }
+
+  BuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub "${EnvironmentName}-ui-build"
+      ServiceRole: !GetAtt BuildRole.Arn
+      Artifacts: { Type: CODEPIPELINE }
+      Source: { Type: CODEPIPELINE, BuildSpec: services/ui/buildspec.yml }
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:7.0
+        EnvironmentVariables:
+          - { Name: EKS_CLUSTER_NAME, Value: !ImportValue { "Fn::Sub": "${EksClusterStackName}-ClusterName" } }
+          - { Name: ORCHESTRATOR_NAMESPACE, Value: !Ref OrchestratorNamespace }
+          - { Name: AWS_DEFAULT_REGION, Value: !Ref AWS::Region }
+      LogsConfig: { CloudWatchLogs: { GroupName: !Ref BuildLogGroup, Status: ENABLED } }
+
+  # --------------------------------------------------------------- deploy
+  DeployLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: { LogGroupName: !Sub "/codebuild/${EnvironmentName}-ui-deploy", RetentionInDays: 14 }
+
+  DeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${EnvironmentName}-ui-cicd-deploy-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - { Effect: Allow, Principal: { Service: codebuild.amazonaws.com }, Action: sts:AssumeRole }
+      Policies:
+        - PolicyName: DeployPermissions
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - { Effect: Allow, Action: ["logs:CreateLogStream", "logs:PutLogEvents"], Resource: !GetAtt DeployLogGroup.Arn }
+              - Effect: Allow
+                Action: ["s3:PutObject", "s3:DeleteObject", "s3:ListBucket"]
+                Resource:
+                  - !Sub
+                    - "arn:aws:s3:::${BucketName}"
+                    - BucketName: !ImportValue { "Fn::Sub": "${UiStackName}-UiBucketName" }
+                  - !Sub
+                    - "arn:aws:s3:::${BucketName}/*"
+                    - BucketName: !ImportValue { "Fn::Sub": "${UiStackName}-UiBucketName" }
+              - Effect: Allow
+                Action: cloudfront:CreateInvalidation
+                Resource: !Sub
+                  - "arn:aws:cloudfront::${AWS::AccountId}:distribution/${DistId}"
+                  - DistId: !ImportValue { "Fn::Sub": "${UiStackName}-DistributionId" }
+
+  DeployProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub "${EnvironmentName}-ui-deploy"
+      ServiceRole: !GetAtt DeployRole.Arn
+      Artifacts: { Type: CODEPIPELINE }
+      Source: { Type: CODEPIPELINE, BuildSpec: services/ui/deployspec.yml }
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:7.0
+        EnvironmentVariables:
+          - { Name: UI_BUCKET_NAME, Value: !ImportValue { "Fn::Sub": "${UiStackName}-UiBucketName" } }
+          - { Name: DISTRIBUTION_ID, Value: !ImportValue { "Fn::Sub": "${UiStackName}-DistributionId" } }
+          - { Name: AWS_DEFAULT_REGION, Value: !Ref AWS::Region }
+      LogsConfig: { CloudWatchLogs: { GroupName: !Ref DeployLogGroup, Status: ENABLED } }
+
+  # ------------------------------------------------------------- pipeline
+  PipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${EnvironmentName}-ui-cicd-pipeline-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - { Effect: Allow, Principal: { Service: codepipeline.amazonaws.com }, Action: sts:AssumeRole }
+      Policies:
+        - PolicyName: PipelinePermissions
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: codestar-connections:UseConnection
+                Resource: !ImportValue { "Fn::Sub": "${CicdFoundationStackName}-GitHubConnectionArn" }
+              - Effect: Allow
+                Action: ["codebuild:StartBuild", "codebuild:BatchGetBuilds"]
+                Resource: [!GetAtt BuildProject.Arn, !GetAtt DeployProject.Arn]
+              - Effect: Allow
+                Action: ["s3:GetObject", "s3:PutObject", "s3:GetBucketVersioning"]
+                Resource:
+                  - !ImportValue { "Fn::Sub": "${CicdFoundationStackName}-ArtifactBucketArn" }
+                  - !Sub
+                    - "${BucketArn}/*"
+                    - BucketArn: !ImportValue { "Fn::Sub": "${CicdFoundationStackName}-ArtifactBucketArn" }
+
+  Pipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: !Sub "${EnvironmentName}-ui-pipeline"
+      PipelineType: V2
+      RoleArn: !GetAtt PipelineRole.Arn
+      ArtifactStore: { Type: S3, Location: !ImportValue { "Fn::Sub": "${CicdFoundationStackName}-ArtifactBucketName" } }
+      Triggers:
+        - ProviderType: CodeStarSourceConnection
+          GitConfiguration:
+            SourceActionName: Source
+            Push:
+              - Branches: { Includes: [!Ref BranchName] }
+                FilePaths: { Includes: ["services/ui/**"] }
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: Source
+              ActionTypeId: { Category: Source, Owner: AWS, Provider: CodeStarSourceConnection, Version: "1" }
+              Configuration:
+                ConnectionArn: !ImportValue { "Fn::Sub": "${CicdFoundationStackName}-GitHubConnectionArn" }
+                FullRepositoryId: !Sub "${RepoOwner}/${RepoName}"
+                BranchName: !Ref BranchName
+                DetectChanges: "false"
+              OutputArtifacts: [{ Name: SourceOutput }]
+        - Name: Build
+          Actions:
+            - Name: Build
+              ActionTypeId: { Category: Build, Owner: AWS, Provider: CodeBuild, Version: "1" }
+              Configuration: { ProjectName: !Ref BuildProject }
+              InputArtifacts: [{ Name: SourceOutput }]
+              OutputArtifacts: [{ Name: BuildOutput }]
+        - Name: Deploy
+          Actions:
+            - Name: Deploy
+              ActionTypeId: { Category: Build, Owner: AWS, Provider: CodeBuild, Version: "1" }
+              Configuration: { ProjectName: !Ref DeployProject }
+              InputArtifacts: [{ Name: BuildOutput }]
+
+Outputs:
+  PipelineName:
+    Value: !Ref Pipeline
+    Export: { Name: !Sub "${AWS::StackName}-PipelineName" }

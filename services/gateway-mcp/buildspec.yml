@@ -1,0 +1,20 @@
+version: 0.2
+
+phases:
+  pre_build:
+    commands:
+      - IMAGE_TAG=${CODEBUILD_RESOLVED_SOURCE_VERSION:0:12}
+      - IMAGE_URI="${ECR_REPO_URI}:${IMAGE_TAG}"
+      - aws ecr get-login-password --region "$AWS_DEFAULT_REGION" | docker login --username AWS --password-stdin "${ECR_REPO_URI%%/*}"
+  build:
+    commands:
+      - docker build -t "$IMAGE_URI" -t "${ECR_REPO_URI}:latest" services/gateway-mcp
+  post_build:
+    commands:
+      - docker push "$IMAGE_URI"
+      - docker push "${ECR_REPO_URI}:latest"
+      - printf '[{"name":"%s","imageUri":"%s"}]' "$CONTAINER_NAME" "$IMAGE_URI" > imagedefinitions.json
+
+artifacts:
+  files:
+    - imagedefinitions.json

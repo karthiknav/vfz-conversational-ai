@@ -1,0 +1,230 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  CodePipeline for the orchestrator (EKS target). Only fires on pushes to
+  `services/orchestrator/**` or `infra/k8s/orchestrator/**` on the main
+  branch (CodePipeline V2 push-trigger path filter). Build stage builds +
+  pushes the image to ECR; Deploy stage runs `kubectl set image` +
+  `kubectl rollout status` against the orchestrator Deployment — it does
+  NOT re-render the `infra/k8s/orchestrator/*.yaml` manifests, since those
+  also carry values that only change when the surrounding CloudFormation
+  stacks change (see infra/cloudformation/README.md step 7 for that
+  provisioning-time flow). Re-apply the manifests by hand if anything
+  besides the image tag needs to change.
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: vfz-poc
+  CicdFoundationStackName:
+    Type: String
+    Default: vfz-cicd-foundation
+  EcrStackName:
+    Type: String
+    Default: vfz-ecr
+  EksClusterStackName:
+    Type: String
+    Default: vfz-eks-cluster
+  RepoOwner:
+    Type: String
+    Description: GitHub org/user that owns this repo (e.g. "your-org").
+  RepoName:
+    Type: String
+    Default: vfz-conversational-ai
+  BranchName:
+    Type: String
+    Default: main
+  OrchestratorNamespace:
+    Type: String
+    Default: orchestrator
+
+Resources:
+  # --------------------------------------------------------------- build
+  BuildLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: { LogGroupName: !Sub "/codebuild/${EnvironmentName}-orchestrator-build", RetentionInDays: 14 }
+
+  BuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${EnvironmentName}-orchestrator-cicd-build-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - { Effect: Allow, Principal: { Service: codebuild.amazonaws.com }, Action: sts:AssumeRole }
+      Policies:
+        - PolicyName: BuildPermissions
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ["logs:CreateLogStream", "logs:PutLogEvents"]
+                Resource: !GetAtt BuildLogGroup.Arn
+              - Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:InitiateLayerUpload
+                  - ecr:UploadLayerPart
+                  - ecr:CompleteLayerUpload
+                  - ecr:PutImage
+                  - ecr:BatchGetImage
+                Resource: !Sub "arn:aws:ecr:${AWS::Region}:${AWS::AccountId}:repository/${EnvironmentName}/orchestrator"
+
+  BuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub "${EnvironmentName}-orchestrator-build"
+      ServiceRole: !GetAtt BuildRole.Arn
+      Artifacts: { Type: CODEPIPELINE }
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: services/orchestrator/buildspec.yml
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:7.0
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - { Name: ECR_REPO_URI, Value: !ImportValue { "Fn::Sub": "${EcrStackName}-OrchestratorRepoUri" } }
+          - { Name: AWS_DEFAULT_REGION, Value: !Ref AWS::Region }
+      LogsConfig:
+        CloudWatchLogs: { GroupName: !Ref BuildLogGroup, Status: ENABLED }
+
+  # --------------------------------------------------------------- deploy
+  DeployLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: { LogGroupName: !Sub "/codebuild/${EnvironmentName}-orchestrator-deploy", RetentionInDays: 14 }
+
+  DeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${EnvironmentName}-orchestrator-cicd-deploy-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - { Effect: Allow, Principal: { Service: codebuild.amazonaws.com }, Action: sts:AssumeRole }
+      Policies:
+        - PolicyName: DeployPermissions
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ["logs:CreateLogStream", "logs:PutLogEvents"]
+                Resource: !GetAtt DeployLogGroup.Arn
+              - Effect: Allow
+                Action: ["eks:DescribeCluster"]
+                Resource: !Sub
+                  - "arn:aws:eks:${AWS::Region}:${AWS::AccountId}:cluster/${ClusterName}"
+                  - ClusterName: !ImportValue { "Fn::Sub": "${EksClusterStackName}-ClusterName" }
+
+  # Grants this CodeBuild role permission inside the cluster itself (IAM
+  # alone isn't enough under AuthenticationMode: API_AND_CONFIG_MAP — the
+  # principal also needs a k8s-facing grant). Scoped to the orchestrator
+  # namespace only, editing workloads there, not cluster-admin.
+  DeployAccessEntry:
+    Type: AWS::EKS::AccessEntry
+    Properties:
+      ClusterName: !ImportValue { "Fn::Sub": "${EksClusterStackName}-ClusterName" }
+      PrincipalArn: !GetAtt DeployRole.Arn
+      AccessPolicies:
+        - PolicyArn: arn:aws:eks::aws:cluster-access-policy/AmazonEKSEditPolicy
+          AccessScope: { Type: namespace, Namespaces: [!Ref OrchestratorNamespace] }
+
+  DeployProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub "${EnvironmentName}-orchestrator-deploy"
+      ServiceRole: !GetAtt DeployRole.Arn
+      Artifacts: { Type: CODEPIPELINE }
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: services/orchestrator/deployspec.yml
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:7.0
+        EnvironmentVariables:
+          - { Name: EKS_CLUSTER_NAME, Value: !ImportValue { "Fn::Sub": "${EksClusterStackName}-ClusterName" } }
+          - { Name: ORCHESTRATOR_NAMESPACE, Value: !Ref OrchestratorNamespace }
+          - { Name: AWS_DEFAULT_REGION, Value: !Ref AWS::Region }
+      LogsConfig:
+        CloudWatchLogs: { GroupName: !Ref DeployLogGroup, Status: ENABLED }
+
+  # ------------------------------------------------------------- pipeline
+  PipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${EnvironmentName}-orchestrator-cicd-pipeline-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - { Effect: Allow, Principal: { Service: codepipeline.amazonaws.com }, Action: sts:AssumeRole }
+      Policies:
+        - PolicyName: PipelinePermissions
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: codestar-connections:UseConnection
+                Resource: !ImportValue { "Fn::Sub": "${CicdFoundationStackName}-GitHubConnectionArn" }
+              - Effect: Allow
+                Action: ["codebuild:StartBuild", "codebuild:BatchGetBuilds"]
+                Resource: [!GetAtt BuildProject.Arn, !GetAtt DeployProject.Arn]
+              - Effect: Allow
+                Action: ["s3:GetObject", "s3:PutObject", "s3:GetBucketVersioning"]
+                Resource:
+                  - !ImportValue { "Fn::Sub": "${CicdFoundationStackName}-ArtifactBucketArn" }
+                  - !Sub
+                    - "${BucketArn}/*"
+                    - BucketArn: !ImportValue { "Fn::Sub": "${CicdFoundationStackName}-ArtifactBucketArn" }
+
+  Pipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: !Sub "${EnvironmentName}-orchestrator-pipeline"
+      PipelineType: V2
+      RoleArn: !GetAtt PipelineRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !ImportValue { "Fn::Sub": "${CicdFoundationStackName}-ArtifactBucketName" }
+      Triggers:
+        - ProviderType: CodeStarSourceConnection
+          GitConfiguration:
+            SourceActionName: Source
+            Push:
+              - Branches: { Includes: [!Ref BranchName] }
+                FilePaths: { Includes: ["services/orchestrator/**", "infra/k8s/orchestrator/**"] }
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: Source
+              ActionTypeId: { Category: Source, Owner: AWS, Provider: CodeStarSourceConnection, Version: "1" }
+              Configuration:
+                ConnectionArn: !ImportValue { "Fn::Sub": "${CicdFoundationStackName}-GitHubConnectionArn" }
+                FullRepositoryId: !Sub "${RepoOwner}/${RepoName}"
+                BranchName: !Ref BranchName
+                DetectChanges: "false"
+              OutputArtifacts: [{ Name: SourceOutput }]
+        - Name: Build
+          Actions:
+            - Name: Build
+              ActionTypeId: { Category: Build, Owner: AWS, Provider: CodeBuild, Version: "1" }
+              Configuration: { ProjectName: !Ref BuildProject }
+              InputArtifacts: [{ Name: SourceOutput }]
+              OutputArtifacts: [{ Name: BuildOutput }]
+        - Name: Deploy
+          Actions:
+            - Name: Deploy
+              ActionTypeId: { Category: Build, Owner: AWS, Provider: CodeBuild, Version: "1" }
+              Configuration: { ProjectName: !Ref DeployProject }
+              InputArtifacts: [{ Name: BuildOutput }]
+
+Outputs:
+  PipelineName:
+    Value: !Ref Pipeline
+    Export: { Name: !Sub "${AWS::StackName}-PipelineName" }
+  DeployRoleArn:
+    Value: !GetAtt DeployRole.Arn
+    Export: { Name: !Sub "${AWS::StackName}-DeployRoleArn" }

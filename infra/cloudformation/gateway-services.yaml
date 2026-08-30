@@ -397,3 +397,14 @@ Outputs:
   GatewayMcpUrlParameterName:
     Value: !Ref GatewayMcpUrlParameter
     Export: { Name: !Sub "${AWS::StackName}-GatewayMcpUrlParameterName" }
+  # Consumed by cicd-pipelines-ecs.yaml's native CodePipeline "ECS" deploy
+  # actions, which take a ClusterName/ServiceName pair rather than an ARN.
+  GatewayServiceName:
+    Value: !Sub "${EnvironmentName}-gateway-mcp"
+    Export: { Name: !Sub "${AWS::StackName}-GatewayServiceName" }
+  BluemarbleServiceName:
+    Value: !Sub "${EnvironmentName}-mock-bluemarble"
+    Export: { Name: !Sub "${AWS::StackName}-BluemarbleServiceName" }
+  SalesforceServiceName:
+    Value: !Sub "${EnvironmentName}-mock-salesforce"
+    Export: { Name: !Sub "${AWS::StackName}-SalesforceServiceName" }
