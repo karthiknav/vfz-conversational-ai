@@ -354,7 +354,7 @@ Resources:
       FromPort: 5432
       ToPort: 5432
       SourceSecurityGroupId: !Ref GatewayTaskSecurityGroup
-      Description: gateway-mcp task SG -> Postgres (covers gateway-mcp; mocks reach Postgres through the same SG's peers below)
+      Description: gateway-mcp task SG to Postgres (covers gateway-mcp; mocks reach Postgres through the same SGs peers below)
   DbIngressFromBluemarble:
     Type: AWS::EC2::SecurityGroupIngress
     Properties:
@@ -363,7 +363,7 @@ Resources:
       FromPort: 5432
       ToPort: 5432
       SourceSecurityGroupId: !Ref BluemarbleSecurityGroup
-      Description: mock-bluemarble -> Postgres
+      Description: mock-bluemarble to Postgres
   DbIngressFromSalesforce:
     Type: AWS::EC2::SecurityGroupIngress
     Properties:
@@ -372,7 +372,7 @@ Resources:
       FromPort: 5432
       ToPort: 5432
       SourceSecurityGroupId: !Ref SalesforceSecurityGroup
-      Description: mock-salesforce -> Postgres
+      Description: mock-salesforce to Postgres
 
   # ------------------------------------------------------- publish the URL
   GatewayMcpUrlParameter:

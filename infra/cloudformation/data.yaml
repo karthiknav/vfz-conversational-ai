@@ -62,7 +62,7 @@ Resources:
       FromPort: 5432
       ToPort: 5432
       SourceSecurityGroupId: !ImportValue { "Fn::Sub": "${EksClusterStackName}-ClusterSharedSecurityGroupId" }
-      Description: orchestrator pods (EKS shared node SG) -> Postgres
+      Description: orchestrator pods (EKS shared node SG) to Postgres
 
   DbInstance:
     Type: AWS::RDS::DBInstance
