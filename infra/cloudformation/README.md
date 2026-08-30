@@ -186,7 +186,6 @@ aws cloudformation deploy \
     AppSecretsStackName=vfz-app-secrets \
     DataStackName=vfz-data \
     LoadBalancerControllerPolicyArn=<arn from above> \
-    BedrockModelId=anthropic.claude-3-5-sonnet-20241022-v2:0 \
     BedrockGuardrailId=<guardrail-id-or-leave-blank> \
   --capabilities CAPABILITY_NAMED_IAM \
   --region us-east-1
@@ -571,10 +570,14 @@ one specific `namespace:serviceaccount` subject (via `StringEquals` on
 `<oidc-host>:sub`) so no other pod in the cluster can assume them:
 
 - `OrchestratorRole` — trusts `system:serviceaccount:<namespace>:orchestrator`.
-  Grants `bedrock:InvokeModel`/`InvokeModelWithResponseStream` scoped to one
-  foundation-model ARN, `bedrock:ApplyGuardrail` scoped to a guardrail ARN
-  (only if `BedrockGuardrailId` is set), and `secretsmanager:GetSecretValue`
-  on the gateway API key, Langfuse, and DB secrets.
+  Grants `bedrock:InvokeModel`/`InvokeModelWithResponseStream` on all
+  foundation models (`foundation-model/*`) rather than one pinned model ID,
+  so switching `BEDROCK_MODEL_ID` in the orchestrator Deployment's env
+  doesn't require redeploying this stack; `bedrock:ApplyGuardrail` likewise
+  scoped to all guardrails (`guardrail/*`) rather than one pinned ID, and
+  only granted at all if `BedrockGuardrailId` is set; and
+  `secretsmanager:GetSecretValue` on the gateway API key, Langfuse, and DB
+  secrets.
 - `LoadBalancerControllerRole` — trusts
   `system:serviceaccount:kube-system:aws-load-balancer-controller`, and
   attaches the AWS-maintained `AWSLoadBalancerControllerIAMPolicy` (fetched
@@ -585,6 +588,44 @@ Note the trust-policy JSON is built as a raw `!Sub` JSON string rather than
 nested YAML: CloudFormation has no clean way to compute a *dynamic map key*
 (`"<oidc-host>:sub"`) in native syntax, but `Json`-typed properties accept a
 pre-rendered JSON string just as well.
+
+#### How the IRSA trust actually works
+
+Both roles' `AssumeRolePolicyDocument` grants `sts:AssumeRoleWithWebIdentity`
+(not the more familiar cross-account `sts:AssumeRole`) to a `Federated`
+principal — `eks-cluster.yaml`'s `OidcProvider` resource, i.e. the cluster's
+own OIDC issuer registered as an IAM identity provider. Two `StringEquals`
+conditions must both hold before STS will honor the request:
+
+- `<oidc-host>:aud` = `sts.amazonaws.com` — the token was minted for calling
+  STS, not for some other audience.
+- `<oidc-host>:sub` = `system:serviceaccount:<namespace>:<name>` — the token
+  belongs to exactly one Kubernetes `ServiceAccount`, e.g.
+  `system:serviceaccount:orchestrator:orchestrator` for `OrchestratorRole`.
+  This is the actual access boundary: any other pod in the cluster,
+  including ones in the same namespace using the `default` service account,
+  presents a token with a different `sub` claim and gets denied.
+
+The token itself never touches CloudFormation — it's supplied at runtime by
+the EKS Pod Identity webhook (a mutating admission controller installed with
+every EKS cluster). When a pod's spec references a `ServiceAccount` carrying
+the `eks.amazonaws.com/role-arn` annotation (`service-account.yaml`'s
+`orchestrator` `ServiceAccount`, in the k8s-manifests section below), the
+webhook injects `AWS_ROLE_ARN` and `AWS_WEB_IDENTITY_TOKEN_FILE` env vars
+into that pod, plus a projected volume containing a short-lived JWT signed
+by the cluster's OIDC issuer and auto-rotated by the kubelet (default
+1-hour expiry). Any IRSA-aware AWS SDK (boto3 included) picks up those two
+env vars automatically and exchanges the JWT for temporary STS credentials
+on first use — no code in `services/orchestrator` requests this explicitly.
+
+This is also why IRSA is preferred over `eks-nodegroup.yaml`'s `NodeRole`:
+the node role is attached to the EC2 instance profile and would be
+reachable by *any* pod scheduled on that node via the instance metadata
+service, whereas IRSA credentials are scoped per-pod, only to whichever
+`ServiceAccount` that pod actually mounts. `OrchestratorRole` is reachable
+solely by pods using the `orchestrator` `ServiceAccount`; `NodeRole` grants
+nothing Bedrock- or Secrets-Manager-related in the first place, so even a
+compromised pod on the same node gains nothing extra from it.
 
 ### infra/k8s/orchestrator/ manifests
 

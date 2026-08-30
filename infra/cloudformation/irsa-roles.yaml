@@ -31,9 +31,6 @@ Parameters:
   # --policy-document file://iam_policy.json`, then pass the resulting ARN here.
   LoadBalancerControllerPolicyArn:
     Type: String
-  BedrockModelId:
-    Type: String
-    Default: anthropic.claude-3-5-sonnet-20241022-v2:0
   BedrockGuardrailId:
     Type: String
     Default: ""
@@ -79,12 +76,12 @@ Resources:
             Statement:
               - Effect: Allow
                 Action: ["bedrock:InvokeModel", "bedrock:InvokeModelWithResponseStream"]
-                Resource: !Sub "arn:aws:bedrock:${AWS::Region}::foundation-model/${BedrockModelId}"
+                Resource: !Sub "arn:aws:bedrock:${AWS::Region}::foundation-model/*"
               - !If
                 - HasGuardrail
                 - Effect: Allow
                   Action: bedrock:ApplyGuardrail
-                  Resource: !Sub "arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:guardrail/${BedrockGuardrailId}"
+                  Resource: !Sub "arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:guardrail/*"
                 - !Ref AWS::NoValue
         - PolicyName: ReadSecrets
           PolicyDocument:
