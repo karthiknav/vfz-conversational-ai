@@ -24,7 +24,7 @@ spec:
             - containerPort: 8000
           env:
             - { name: AWS_REGION, value: "__AWS_REGION__" }
-            - { name: BEDROCK_MODEL_ID, value: "anthropic.claude-3-5-sonnet-20241022-v2:0" }
+            - { name: BEDROCK_MODEL_ID, value: "anthropic.claude-sonnet-4-6" }
             - { name: BEDROCK_GUARDRAIL_ID, value: "__BEDROCK_GUARDRAIL_ID__" }
             - { name: BEDROCK_GUARDRAIL_VERSION, value: "DRAFT" }
             - { name: LANGFUSE_HOST, value: "https://cloud.langfuse.com" }

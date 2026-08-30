@@ -1,5 +1,6 @@
 import asyncio
 import os
+from urllib.parse import quote
 
 import asyncpg
 
@@ -7,7 +8,7 @@ _pool: asyncpg.Pool | None = None
 _pool_lock = asyncio.Lock()
 
 DSN = (
-    f"postgresql://{os.environ['POSTGRES_USER']}:{os.environ['POSTGRES_PASSWORD']}"
+    f"postgresql://{quote(os.environ['POSTGRES_USER'], safe='')}:{quote(os.environ['POSTGRES_PASSWORD'], safe='')}"
     f"@{os.environ['POSTGRES_HOST']}:{os.environ['POSTGRES_PORT']}/{os.environ['POSTGRES_DB']}"
 )
 

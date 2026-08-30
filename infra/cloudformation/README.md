@@ -203,6 +203,8 @@ helm repo add eks https://aws.github.io/eks-charts && helm repo update
 helm install aws-load-balancer-controller eks/aws-load-balancer-controller \
   -n kube-system \
   --set clusterName=vfz-poc-orchestrator \
+  --set region=us-east-1 \
+  --set vpcId=<network VpcId output> \
   --set serviceAccount.create=true \
   --set serviceAccount.name=aws-load-balancer-controller \
   --set serviceAccount.annotations."eks\.amazonaws\.com/role-arn"=<irsa-roles LoadBalancerControllerRoleArn output>
@@ -214,6 +216,17 @@ kubectl apply -f https://raw.githubusercontent.com/aws/secrets-store-csi-driver-
 helm repo add metrics-server https://kubernetes-sigs.github.io/metrics-server/
 helm install metrics-server metrics-server/metrics-server -n kube-system
 ```
+
+`region`/`vpcId` are passed explicitly rather than left for the controller to
+discover via EC2 instance metadata (IMDS) at startup — belt-and-suspenders
+against `eks-nodegroup.yaml`'s launch template already fixing the underlying
+cause: IMDSv2's default `HttpPutResponseHopLimit` (1) is one hop too few for
+a call made from inside a pod rather than the host, so any in-pod IMDS call
+times out unless the launch template raises it to 2 (which `NodeLaunchTemplate`
+in that stack now does). Without either fix, the controller pods crash-loop
+on `failed to get VPC ID: ... context deadline exceeded`, its webhook service
+ends up with no endpoints, and *any* pod-creating `helm install`/`kubectl apply`
+in the cluster fails admission — not just this controller's own resources.
 
 **How secrets actually get to the orchestrator pod:** the two `secrets-store-csi-driver`
 commands above install two separate DaemonSets, not one — the generic CSI driver
@@ -238,6 +251,34 @@ Caveat: env vars are fixed at container start. If a secret rotates in Secrets Ma
 afterward, the CSI driver can refresh the *mounted files* on its poll interval, but the
 derived k8s `Secret` and the pod's env vars will not update — a rotated secret only takes
 effect after the pod is restarted.
+
+**End-to-end map, source secret to consuming code** — each row is one value's
+full path from where it's stored to the line in `services/orchestrator` that
+reads it:
+
+| Secrets Manager / SSM source | `secret-provider-class.yaml` alias | `orchestrator-secrets` key | Read in app code |
+| --- | --- | --- | --- |
+| `vfz-poc/db-credentials` → `username` | `db-username` | `POSTGRES_USER` | `graph.py`: `os.environ["POSTGRES_USER"]` |
+| `vfz-poc/db-credentials` → `password` | `db-password` | `POSTGRES_PASSWORD` | `graph.py`: `os.environ["POSTGRES_PASSWORD"]` |
+| `vfz-poc/gateway-api-key` → `api_key` | `gateway-api-key-value` | `GATEWAY_API_KEY` | `mcp_client.py`: `os.environ["GATEWAY_API_KEY"]` |
+| `vfz-poc/langfuse-keys` → `public_key` | `langfuse-public-key` | `LANGFUSE_PUBLIC_KEY` | `langfuse_setup.py`: `os.environ.get("LANGFUSE_PUBLIC_KEY")` |
+| `vfz-poc/langfuse-keys` → `secret_key` | `langfuse-secret-key` | `LANGFUSE_SECRET_KEY` | `langfuse_setup.py`: `os.environ.get("LANGFUSE_SECRET_KEY")` |
+| SSM `/vfz-poc/gateway-mcp-url` | `gateway-mcp-url` | `GATEWAY_MCP_URL` | `mcp_client.py`: `os.environ.get("GATEWAY_MCP_URL", ...)` |
+
+`graph.py` and `mcp_client.py` use the required-key form (`os.environ["X"]`,
+`KeyError` if unset) for the DB credentials and gateway API key — there's no
+sane fallback for either, so a broken CSI sync fails loudly at import time
+rather than limping along. `langfuse_setup.py` and the `GATEWAY_MCP_URL`
+read use `.get()` with a fallback: missing Langfuse keys just disable
+tracing (`get_callback_handler()` returns `None`), and a missing
+`GATEWAY_MCP_URL` falls back to the docker-compose hostname so the same
+image runs locally and in-cluster unchanged.
+
+`POSTGRES_HOST`/`POSTGRES_PORT`/`POSTGRES_DB` follow a completely different
+path — they're literal/placeholder values in `deployment.yaml`'s `env:`
+list, substituted by the `envsubst`/`sed` step below from `data.yaml`'s
+CloudFormation outputs, not synced through `orchestrator-secrets` at all
+(see step 7).
 
 ### 7. Apply the orchestrator manifests
 
@@ -277,7 +318,10 @@ the Deployment's env).
 
 No CloudFormation dependencies, but must be deployed last: the S3 sync
 needs `services/ui/dist` built with `window.ORCHESTRATOR_BASE_URL` already
-pointed at the Ingress ALB hostname noted in step 7.
+pointed at the Ingress ALB hostname noted in step 7. `cicd-pipeline-ui.yaml`
+does this injection automatically on every push (see `services/ui/buildspec.yml`);
+deploying by hand means repeating the same two steps that buildspec runs —
+patch `index.html`, then build — before the `s3 sync`:
 
 ```bash
 aws cloudformation deploy \
@@ -286,9 +330,23 @@ aws cloudformation deploy \
   --parameter-overrides EnvironmentName=vfz-poc \
   --region us-east-1
 
-# then, with services/ui/dist built against the orchestrator's ALB hostname:
+# get the orchestrator Ingress's ALB hostname (noted in step 7)
+ALB_HOSTNAME=$(kubectl get ingress orchestrator -n orchestrator \
+  -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+
+# inject it into index.html's inline script, same sed buildspec.yml runs —
+# do this on a scratch copy, or `git checkout -- services/ui/index.html`
+# afterward, so the real ALB hostname never gets committed
+sed -i "s#<script type=\"module\" src=\"/src/main.js\"></script>#<script>window.ORCHESTRATOR_BASE_URL = \"http://${ALB_HOSTNAME}\";</script>\n  <script type=\"module\" src=\"/src/main.js\"></script>#" \
+  services/ui/index.html
+
+cd services/ui && npm ci && npm run build && cd ../..
+
 aws s3 sync services/ui/dist s3://<ui UiBucketName output> --delete
 aws cloudfront create-invalidation --distribution-id <ui DistributionId output> --paths "/*"
+
+# restore the placeholder so the real hostname doesn't end up in a commit
+git checkout -- services/ui/index.html
 ```
 
 ### 9. cicd-foundation
@@ -441,15 +499,58 @@ auto-attaches to the control plane *and* every managed-node-group
 instance) — this, not `ControlPlaneSecurityGroupId`, is the SG that
 data.yaml grants DB ingress from.
 
+#### Cluster admin access (`ClusterAdminRole` / `ClusterAdminAccessEntry`)
+
+By default, EKS silently grants full cluster-admin (`system:masters`
+equivalent) to whichever IAM principal happened to call `CreateCluster` —
+`AccessConfig.bootstrapClusterCreatorAdminPermissions` defaults to `true`,
+and this template doesn't override it. For a CI/CD-driven deploy that
+principal is whatever role ran the stack, not any human, and the grant
+doesn't appear as an ordinary, auditable `AccessEntry`. `ClusterAdminRole`
++ `ClusterAdminAccessEntry` exist to make admin access explicit and
+version-controlled instead: anyone who can `sts:AssumeRole` into
+`${EnvironmentName}-eks-cluster-admin` (gated by the
+`ClusterAdminTrustedPrincipal` parameter, default: the whole account root —
+narrow this to specific ARNs for real use) gets `AmazonEKSClusterAdminPolicy`
+via that one, reviewable `AccessEntry` resource.
+
+**This is the only admin path this template manages.** Anyone can still be
+granted access directly — bypassing `ClusterAdminRole` entirely — by
+creating a separate `AccessEntry` for their own IAM user/role ARN via
+`aws eks create-access-entry` / `associate-access-policy` (or the console:
+cluster → **Access** tab → **IAM access entries**). That's a normal,
+supported EKS mechanism, but any such entry is *out-of-band*: it won't
+show up in this stack's resources (`aws cloudformation describe-stack-resources
+--stack-name vfz-eks-cluster`), isn't tracked in this template, and will
+silently persist even if `ClusterAdminTrustedPrincipal` is later tightened.
+Run `aws eks list-access-entries --cluster-name <cluster>` periodically to
+check for entries that don't trace back to `ClusterAdminRole` or one of the
+CI/CD deploy roles (see `cicd-pipeline-eks.yaml`'s `DeployAccessEntry` and
+`cicd-pipeline-ui.yaml`'s view-only entry below).
+
 ### eks-nodegroup.yaml
 
 A managed node group for the cluster above, confined to the eks-private
 subnets.
 
+- `NodeLaunchTemplate` — sets `MetadataOptions.HttpPutResponseHopLimit: 2`
+  (IMDSv2 stays required). A managed node group left without a custom
+  launch template gets one auto-generated by EKS, which defaults the hop
+  limit to 1 — one hop too few for a call made from inside a pod (as
+  opposed to the host), so any in-pod IMDS call times out. That's what
+  breaks the AWS Load Balancer Controller specifically: on first boot it
+  falls back to IMDS to discover the VPC ID, times out, crash-loops, and
+  its webhook ends up with no endpoints — which then fails *any*
+  pod-creating `helm install`/`kubectl apply` in the cluster, not just its
+  own resources, since the webhook intercepts all `Service` objects
+  cluster-wide. (The Helm command in "Cluster bootstrap" below also passes
+  `region`/`vpcId` explicitly as a second, independent guard against the
+  same failure mode.)
 - `NodeRole` — worker node IAM role (`AmazonEKSWorkerNodePolicy`,
   `AmazonEC2ContainerRegistryReadOnly`, `AmazonEKS_CNI_Policy`).
 - `NodeGroup` — `t3.medium` by default, 2/2/4 (min/desired/max), AL2023
-  x86_64 AMI, `MaxUnavailable: 1` on rolling updates.
+  x86_64 AMI, `MaxUnavailable: 1` on rolling updates, using
+  `NodeLaunchTemplate` above.
 
 ### gateway-ecs-cluster.yaml
 

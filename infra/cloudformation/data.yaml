@@ -34,7 +34,7 @@ Resources:
         SecretStringTemplate: '{"username":"vfz_admin"}'
         GenerateStringKey: password
         PasswordLength: 32
-        ExcludeCharacters: '"@/\'
+        ExcludePunctuation: true
 
   DbSubnetGroup:
     Type: AWS::RDS::DBSubnetGroup

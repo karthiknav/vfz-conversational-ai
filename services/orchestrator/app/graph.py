@@ -23,6 +23,7 @@ original sketch in docs/architecture-decisions.md:
 
 import os
 from typing import Literal
+from urllib.parse import quote
 
 from langchain_core.messages import AIMessage, SystemMessage
 from langgraph.checkpoint.memory import MemorySaver
@@ -104,8 +105,8 @@ def _postgres_conninfo() -> str | None:
         return None
     port = os.environ.get("POSTGRES_PORT", "5432")
     db = os.environ.get("POSTGRES_DB", "vfz_poc")
-    user = os.environ["POSTGRES_USER"]
-    password = os.environ["POSTGRES_PASSWORD"]
+    user = quote(os.environ["POSTGRES_USER"], safe="")
+    password = quote(os.environ["POSTGRES_PASSWORD"], safe="")
     return f"postgresql://{user}:{password}@{host}:{port}/{db}"
 
 

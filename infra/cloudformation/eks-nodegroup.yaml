@@ -24,9 +24,25 @@ Parameters:
     Default: 2
   MaxSize:
     Type: Number
-    Default: 4
+    Default: 3
 
 Resources:
+  # Managed node groups auto-generate a launch template when none is given,
+  # and that auto-generated one defaults IMDSv2's HttpPutResponseHopLimit to
+  # 1 — enough for processes on the host, but one hop too few for a pod
+  # (bridge network adds a hop), so any in-pod IMDS call times out. This is
+  # what broke the AWS Load Balancer Controller's own VPC-ID discovery on
+  # first boot; bumping the hop limit to 2 here fixes it for every pod on
+  # every node, not just that one controller.
+  NodeLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub "${EnvironmentName}-eks-node-lt"
+      LaunchTemplateData:
+        MetadataOptions:
+          HttpTokens: required
+          HttpPutResponseHopLimit: 2
+
   NodeRole:
     Type: AWS::IAM::Role
     Properties:
@@ -50,6 +66,9 @@ Resources:
       NodeRole: !GetAtt NodeRole.Arn
       InstanceTypes: [!Ref InstanceType]
       AmiType: AL2023_x86_64_STANDARD
+      LaunchTemplate:
+        Id: !Ref NodeLaunchTemplate
+        Version: !GetAtt NodeLaunchTemplate.LatestVersionNumber
       Subnets:
         - !ImportValue { "Fn::Sub": "${NetworkStackName}-EksPrivateSubnet1Id" }
         - !ImportValue { "Fn::Sub": "${NetworkStackName}-EksPrivateSubnet2Id" }

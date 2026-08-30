@@ -34,9 +34,10 @@ app = FastAPI(title="VZ MCP Gateway", lifespan=lifespan)
 app.add_middleware(RateLimitMiddleware)
 app.add_middleware(APIKeyAuthMiddleware)
 
-app.router.routes.append(Mount("/", app=mcp_app))
-
 
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
+
+app.router.routes.append(Mount("/", app=mcp_app))

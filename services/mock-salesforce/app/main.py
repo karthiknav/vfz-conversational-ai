@@ -1,13 +1,14 @@
 import json
 import os
 from contextlib import asynccontextmanager
+from urllib.parse import quote
 
 import asyncpg
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
 DSN = (
-    f"postgresql://{os.environ['POSTGRES_USER']}:{os.environ['POSTGRES_PASSWORD']}"
+    f"postgresql://{quote(os.environ['POSTGRES_USER'], safe='')}:{quote(os.environ['POSTGRES_PASSWORD'], safe='')}"
     f"@{os.environ['POSTGRES_HOST']}:{os.environ['POSTGRES_PORT']}/{os.environ['POSTGRES_DB']}"
 )
 
