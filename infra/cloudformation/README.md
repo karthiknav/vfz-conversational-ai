@@ -121,7 +121,14 @@ aws cloudformation deploy \
   --region us-east-1
 ```
 
-Once `ecr` exists, build and push all four images before continuing:
+Once `ecr` exists, build and push all four images before continuing. This is a
+one-time bootstrap step, required even if you plan to set up CI/CD later:
+`gateway-services.yaml` (step 5) and the orchestrator's k8s Deployment (step 7)
+both hard-reference `<repo>:<tag>`, and the pipelines that could build these
+images for you don't exist until steps 9-10 — which themselves depend on 5 and
+8 already being deployed. Once the CI/CD pipelines are up, you no longer need
+to repeat this by hand on every change (a push to each service's directory
+triggers its pipeline instead) — but the very first build has to happen here.
 
 ```bash
 aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin <account>.dkr.ecr.us-east-1.amazonaws.com
@@ -288,8 +295,11 @@ aws cloudfront create-invalidation --distribution-id <ui DistributionId output> 
 ### 9. cicd-foundation
 
 Optional — only needed if you want push-to-deploy pipelines instead of
-running steps 4/8's manual `docker build`/`push`/`s3 sync` commands by
-hand on every change. No CloudFormation dependencies.
+re-running steps 4/8's manual `docker build`/`push`/`s3 sync` commands by
+hand on every *subsequent* change. The first build/push in step 4 still has
+to happen manually regardless — these pipelines can't exist until after
+gateway-services (step 5) and ui (step 8) are already deployed, so they can't
+bootstrap the images those steps need. No CloudFormation dependencies.
 
 ```bash
 aws cloudformation deploy \
