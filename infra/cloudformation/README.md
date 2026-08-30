@@ -586,6 +586,64 @@ nested YAML: CloudFormation has no clean way to compute a *dynamic map key*
 (`"<oidc-host>:sub"`) in native syntax, but `Json`-typed properties accept a
 pre-rendered JSON string just as well.
 
+### infra/k8s/orchestrator/ manifests
+
+Not CloudFormation — plain Kubernetes manifests applied together (step 7)
+once `irsa-roles.yaml` and the Helm-installed cluster add-ons (ALB
+controller, Secrets Store CSI driver + ASCP, metrics-server — see "Cluster
+bootstrap" above) are in place. Their `__PLACEHOLDER__` tokens are
+substituted from CloudFormation outputs before `kubectl apply` — see the
+`envsubst`/`sed` loop in step 7.
+
+- **namespace.yaml** — creates the `orchestrator` namespace; every other
+  manifest here is scoped to it.
+- **service-account.yaml** — `ServiceAccount` `orchestrator`, annotated
+  with `eks.amazonaws.com/role-arn` set to `irsa-roles.yaml`'s
+  `OrchestratorRoleArn` output. This is the IRSA binding: any pod that
+  mounts this service account (the Deployment does) can assume
+  `OrchestratorRole` for Bedrock and Secrets Manager access with no static
+  AWS credentials in the pod.
+- **secret-provider-class.yaml** — `SecretProviderClass`
+  `orchestrator-secrets` (`provider: aws`). Lists three Secrets Manager
+  objects (`vfz-poc/gateway-api-key`, `vfz-poc/db-credentials`,
+  `vfz-poc/langfuse-keys`) and one SSM parameter
+  (`/vfz-poc/gateway-mcp-url`, published by `gateway-services.yaml`), each
+  with a `jmesPath` that extracts and renames specific fields. Its
+  `secretObjects` block re-syncs those extracted values into a real k8s
+  `Secret` named `orchestrator-secrets`, remapped to the key names
+  `deployment.yaml` expects (`POSTGRES_USER`, `POSTGRES_PASSWORD`,
+  `GATEWAY_API_KEY`, `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY`,
+  `GATEWAY_MCP_URL`). The full mechanics — which CSI DaemonSet does what,
+  and the caveat that pod env vars don't pick up a secret rotation until
+  the pod restarts — are covered under "Cluster bootstrap" above.
+- **deployment.yaml** — the orchestrator pod spec: 2 replicas,
+  `serviceAccountName: orchestrator` (so pods inherit `OrchestratorRole`),
+  image `__ECR_ORCHESTRATOR_IMAGE_URI__`, `envFrom` the
+  `orchestrator-secrets` k8s `Secret` plus literal/placeholder env vars
+  (Bedrock model + guardrail IDs, Langfuse host, Postgres host/port/db
+  name, and `ALLOWED_ORIGINS` set to the UI's CloudFront URL), the
+  `secrets-store` CSI volume mounted read-only at `/mnt/secrets-store`
+  (the app itself never reads these files — mounting is only what
+  triggers the CSI sync into the `envFrom` Secret above), and `/health`
+  readiness/liveness probes. A comment on the file flags a prerequisite:
+  running with `replicas > 1` requires the orchestrator's LangGraph
+  checkpointer already switched from in-memory `MemorySaver` to
+  `AsyncPostgresSaver` (`services/orchestrator/app/graph.py`), or state
+  won't be shared across pods.
+- **service.yaml** — `ClusterIP` `Service` `orchestrator`, port 8000,
+  selecting `app: orchestrator`. Internal only — the Ingress below is the
+  actual public entry point.
+- **ingress.yaml** — an ALB `Ingress` provisioned by the AWS Load Balancer
+  Controller, internet-facing, `target-type: ip`, health check on
+  `/health`, HTTP-only on port 80 (no ACM cert wired up — POC, no custom
+  domain). Its ALB's DNS name is the "Ingress ALB hostname" referenced
+  throughout steps 7-8 and consumed by `ui.yaml`'s build and
+  `cicd-pipeline-ui.yaml`.
+- **hpa.yaml** — a `HorizontalPodAutoscaler` targeting the Deployment,
+  2-6 replicas, scaling on 70% average CPU utilization; requires
+  metrics-server (installed in "Cluster bootstrap") to supply the
+  underlying metrics.
+
 ### ui.yaml
 
 Static hosting for the chat UI — deploy last, since the build it serves
