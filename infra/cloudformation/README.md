@@ -210,7 +210,9 @@ helm install aws-load-balancer-controller eks/aws-load-balancer-controller \
   --set serviceAccount.annotations."eks\.amazonaws\.com/role-arn"=<irsa-roles LoadBalancerControllerRoleArn output>
 
 helm repo add secrets-store-csi-driver https://kubernetes-sigs.github.io/secrets-store-csi-driver/charts
-helm install csi-secrets-store secrets-store-csi-driver/secrets-store-csi-driver -n kube-system
+helm install csi-secrets-store secrets-store-csi-driver/secrets-store-csi-driver \
+  -n kube-system \
+  --set tokenRequests[0].audience=sts.amazonaws.com
 kubectl apply -f https://raw.githubusercontent.com/aws/secrets-store-csi-driver-provider-aws/main/deployment/aws-provider-installer.yaml
 
 helm repo add metrics-server https://kubernetes-sigs.github.io/metrics-server/
@@ -227,6 +229,23 @@ in that stack now does). Without either fix, the controller pods crash-loop
 on `failed to get VPC ID: ... context deadline exceeded`, its webhook service
 ends up with no endpoints, and *any* pod-creating `helm install`/`kubectl apply`
 in the cluster fails admission — not just this controller's own resources.
+
+`--set tokenRequests[0].audience=sts.amazonaws.com` on the `csi-secrets-store`
+install is required, not cosmetic: the chart's `CSIDriver` template only
+populates `spec.tokenRequests` when a value is explicitly passed — omit it
+and kubelet mounts the volume with no service account token attached at
+all, which surfaces later (only once a pod actually tries to mount a
+`secrets-store` volume — the driver install itself succeeds either way) as
+`FailedMount ... CSI token error: serviceAccount.tokens not provided -
+ensure tokenRequests is configured in CSIDriver`. The audience must match
+`eks-cluster.yaml`'s `OidcProvider` resource, which registers
+`ClientIdList: ["sts.amazonaws.com"]` — that's what lets ASCP exchange the
+token for STS credentials via `AssumeRoleWithWebIdentity`. `CSIDriver.spec`
+fields are immutable after creation, so if the driver was already installed
+without this flag, fixing it means `helm uninstall csi-secrets-store -n
+kube-system && kubectl delete csidriver secrets-store.csi.k8s.io`, then
+reinstalling with the flag above — a plain `helm upgrade` won't patch the
+field in place.
 
 **How secrets actually get to the orchestrator pod:** the two `secrets-store-csi-driver`
 commands above install two separate DaemonSets, not one — the generic CSI driver
