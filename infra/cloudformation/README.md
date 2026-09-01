@@ -556,6 +556,153 @@ touching `services/ui/**` triggers the UI pipeline — each is scoped to its
 own directory (CodePipeline V2 push-trigger path filters), so one service's
 change never redeploys another.
 
+### 11. Seed the database (one-time, any time after step 4)
+
+`db/init/*.sql` (`001_audit_trail.sql`, `002_bluemarble_salesforce_schemas.sql`,
+`003_customer360_seed.sql`, `004_governed_views.sql`) create the schemas/seed
+data that gateway-mcp's mock services and the orchestrator's governed views
+depend on. They're written to run via Postgres's `docker-entrypoint-initdb.d`
+convention, which only fires automatically for a fresh **local** `docker
+compose up` container — RDS does not do this, and nothing else in this deploy
+order runs them, so skipping this step leaves the catalog/customer/audit
+tables missing (`asyncpg.exceptions.UndefinedTableError` from mock-bluemarble,
+surfaced to end users as a vague "technical issue" apology from the chatbot —
+see Troubleshooting).
+
+`data.yaml`'s `DbInstance` has `PubliclyAccessible: false` and sits in the
+`eks-private`/`gateway-private` subnets (no route to the internet inbound),
+so there's no direct path from a laptop. The approach below uses a throwaway
+EC2 instance reachable only through **SSM Session Manager** — no SSH key, no
+public IP, and no inbound security group rule on the instance itself (Session
+Manager connects outbound-only, over the NAT Gateway that already exists per
+network.yaml). The only new network exposure is one temporary
+security-group rule granting that instance's SG access to the DB SG on 5432,
+which step 6 below removes. Everything here is ad-hoc AWS CLI, not a new
+CloudFormation stack — intentionally, since the whole point is to tear it
+down when done.
+
+**1. Look up what you need** (adjust stack names if you deployed under
+different ones):
+
+```bash
+VPC_ID=$(aws cloudformation list-exports --region us-east-1 \
+  --query "Exports[?Name=='vfz-network-VpcId'].Value" --output text)
+SUBNET_ID=$(aws cloudformation list-exports --region us-east-1 \
+  --query "Exports[?Name=='vfz-network-EksPrivateSubnet1Id'].Value" --output text)
+DB_SG_ID=$(aws cloudformation describe-stacks --region us-east-1 --stack-name vfz-data \
+  --query "Stacks[0].Outputs[?OutputKey=='DbSecurityGroupId'].OutputValue" --output text)
+DB_ENDPOINT=$(aws cloudformation describe-stacks --region us-east-1 --stack-name vfz-data \
+  --query "Stacks[0].Outputs[?OutputKey=='DbEndpoint'].OutputValue" --output text)
+DB_SECRET_ARN=$(aws cloudformation describe-stacks --region us-east-1 --stack-name vfz-data \
+  --query "Stacks[0].Outputs[?OutputKey=='DbSecretArn'].OutputValue" --output text)
+```
+
+**2. Create the bastion's IAM role** (trusts EC2, grants only
+`AmazonSSMManagedInstanceCore` — Session Manager access, nothing else) and a
+security group with **no inbound rules at all** (SSM doesn't need any —
+default egress-allow-all is enough for it to reach the SSM/EC2 messages
+endpoints over NAT):
+
+```bash
+aws iam create-role --role-name vfz-poc-bastion-tmp-role \
+  --assume-role-policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"ec2.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
+aws iam attach-role-policy --role-name vfz-poc-bastion-tmp-role \
+  --policy-arn arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+aws iam create-instance-profile --instance-profile-name vfz-poc-bastion-tmp-profile
+aws iam add-role-to-instance-profile \
+  --instance-profile-name vfz-poc-bastion-tmp-profile --role-name vfz-poc-bastion-tmp-role
+sleep 15   # IAM role/instance-profile propagation before the instance can assume it
+
+BASTION_SG_ID=$(aws ec2 create-security-group --region us-east-1 \
+  --group-name vfz-poc-bastion-tmp --vpc-id "$VPC_ID" \
+  --description "Temporary - DB seeding only, safe to delete after use" \
+  --query GroupId --output text)
+```
+
+**3. Launch the instance** (ARM `t4g.micro` to keep it cheap; no `--key-name`
+— SSM is the only access path). The AMI lookup path starts with `/`, so on
+Windows/Git Bash prefix with `MSYS_NO_PATHCONV=1` or MSYS mangles it into a
+Windows path the same way it does with CloudWatch log group names (see
+Troubleshooting):
+
+```bash
+AMI_ID=$(MSYS_NO_PATHCONV=1 aws ssm get-parameters --region us-east-1 \
+  --names /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64 \
+  --query 'Parameters[0].Value' --output text)
+
+INSTANCE_ID=$(aws ec2 run-instances --region us-east-1 \
+  --image-id "$AMI_ID" --instance-type t4g.micro \
+  --subnet-id "$SUBNET_ID" --security-group-ids "$BASTION_SG_ID" \
+  --iam-instance-profile Name=vfz-poc-bastion-tmp-profile \
+  --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=vfz-poc-bastion-tmp}]' \
+  --query 'Instances[0].InstanceId' --output text)
+
+aws ec2 wait instance-status-ok --region us-east-1 --instance-ids "$INSTANCE_ID"
+# Confirm the SSM agent has actually checked in before starting a session —
+# instance-status-ok doesn't guarantee this:
+aws ssm describe-instance-information --region us-east-1 \
+  --filters "Key=InstanceIds,Values=$INSTANCE_ID" --query 'InstanceInformationList[0].PingStatus'
+```
+
+**4. Open the temporary DB ingress rule**, scoped to only this bastion's SG:
+
+```bash
+aws ec2 authorize-security-group-ingress --region us-east-1 \
+  --group-id "$DB_SG_ID" --protocol tcp --port 5432 --source-group "$BASTION_SG_ID"
+```
+
+**5. Start a port-forwarding session** — this tunnels a port on *your own
+machine* through the bastion to the RDS endpoint, so `psql` runs locally
+against `localhost:15432` and never needs installing on the bastion. Run this
+in its own terminal and leave it running:
+
+```bash
+aws ssm start-session --region us-east-1 --target "$INSTANCE_ID" \
+  --document-name AWS-StartPortForwardingSessionToRemoteHost \
+  --parameters "{\"host\":[\"$DB_ENDPOINT\"],\"portNumber\":[\"5432\"],\"localPortNumber\":[\"15432\"]}"
+```
+
+In a second terminal, fetch the master credentials and run the four scripts
+**in order** against the tunnel:
+
+```bash
+DB_USER=$(aws secretsmanager get-secret-value --region us-east-1 \
+  --secret-id "$DB_SECRET_ARN" --query SecretString --output text | jq -r .username)
+DB_PASSWORD=$(aws secretsmanager get-secret-value --region us-east-1 \
+  --secret-id "$DB_SECRET_ARN" --query SecretString --output text | jq -r .password)
+
+for f in db/init/001_audit_trail.sql db/init/002_bluemarble_salesforce_schemas.sql \
+         db/init/003_customer360_seed.sql db/init/004_governed_views.sql; do
+  echo "=== $f ==="
+  PGPASSWORD="$DB_PASSWORD" psql -h localhost -p 15432 -U "$DB_USER" -d vfz_poc -f "$f" || break
+done
+```
+
+Verify it landed:
+
+```bash
+POSTGRES_HOST=localhost POSTGRES_PORT=15432 POSTGRES_USER="$DB_USER" \
+  POSTGRES_PASSWORD="$DB_PASSWORD" POSTGRES_DB=vfz_poc python scripts/seed_db.py --check
+```
+
+Then `Ctrl+C` the `start-session` terminal to close the tunnel.
+
+**6. Tear down** — nothing from this section should outlive the seeding run:
+
+```bash
+aws ec2 revoke-security-group-ingress --region us-east-1 \
+  --group-id "$DB_SG_ID" --protocol tcp --port 5432 --source-group "$BASTION_SG_ID"
+aws ec2 terminate-instances --region us-east-1 --instance-ids "$INSTANCE_ID"
+aws ec2 wait instance-terminated --region us-east-1 --instance-ids "$INSTANCE_ID"
+aws ec2 delete-security-group --region us-east-1 --group-id "$BASTION_SG_ID"
+aws iam remove-role-from-instance-profile \
+  --instance-profile-name vfz-poc-bastion-tmp-profile --role-name vfz-poc-bastion-tmp-role
+aws iam delete-instance-profile --instance-profile-name vfz-poc-bastion-tmp-profile
+aws iam detach-role-policy --role-name vfz-poc-bastion-tmp-role \
+  --policy-arn arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+aws iam delete-role --role-name vfz-poc-bastion-tmp-role
+```
+
 ## Stack components
 
 ### network.yaml
@@ -1115,6 +1262,134 @@ match `kubectl get ingress orchestrator -n orchestrator -o jsonpath='{.status.lo
 via a `CNAME`/A-alias chain) — the record goes stale if the Ingress was
 ever recreated without also re-running step 7's `route53
 change-resource-record-sets`.
+
+### Browser console shows a CORS error, but the request status is 500 (not 0/blocked)
+
+**Symptoms**: DevTools Console shows something like:
+
+```
+Access to fetch at 'https://<orchestrator-domain>/chat' from origin 'https://<cloudfront-domain>'
+has been blocked by CORS policy: Response to preflight request doesn't pass access control check:
+No 'Access-Control-Allow-Origin' header is present on the requested resource. Status code: 500.
+```
+
+**Root cause**: two different bugs produce this same symptom, and the `Status code: 500` in the
+message (when present) tells you which one you're looking at:
+
+1. **No status code shown, or an OPTIONS preflight fails outright** —
+   `ALLOWED_ORIGINS` on the orchestrator Deployment is empty or doesn't include the
+   calling origin. This happens because `infra/k8s/orchestrator/deployment.yaml`'s
+   `UI_CLOUDFRONT_URL` placeholder can only be filled in *after* `ui.yaml` deploys
+   (step 8), so the manifests get applied once with it blank, and it's easy to
+   forget the documented re-apply-with-`UI_CLOUDFRONT_URL`-set step in "7. Apply
+   the orchestrator manifests" above. Check what's actually live:
+   ```bash
+   kubectl get deployment orchestrator -n orchestrator \
+     -o jsonpath='{.spec.template.spec.containers[0].env}'
+   # look for {"name":"ALLOWED_ORIGINS","value":"https://<cloudfront-domain>"} —
+   # if the "value" key is missing entirely, it's unset.
+   ```
+   **Fix**: re-run step 7's `envsubst`/`sed` loop with `UI_CLOUDFRONT_URL` set (safe,
+   idempotent), or for a quick one-off: `kubectl set env deployment/orchestrator
+   -n orchestrator ALLOWED_ORIGINS="https://<cloudfront-domain>"`. Either way this
+   patches the Deployment's pod template, which triggers an automatic rolling
+   restart — no separate restart step needed. Confirm with
+   `kubectl rollout status deployment/orchestrator -n orchestrator`.
+
+2. **A specific status code like 500 is shown** — CORS is a red herring. `api.py`
+   only adds `CORSMiddleware` around the app; Starlette's own error-handling
+   middleware sits *outside* it, so a response built from an **unhandled
+   exception** never gets `Access-Control-Allow-Origin` attached, and the browser
+   reports it as a blocked CORS request even though the backend genuinely errored.
+   Go straight to the pod logs instead of touching CORS config:
+   ```bash
+   kubectl logs -n orchestrator -l app=orchestrator --tail=100 --prefix=true
+   ```
+   Look for a Python traceback ending in the actual exception. One instance seen
+   in this repo's POC deployment: `BEDROCK_MODEL_ID` set to the bare model ID
+   (`anthropic.claude-sonnet-4-6`) instead of a cross-region inference profile ID
+   (`us.anthropic.claude-sonnet-4-6`) throws `botocore.errorfactory.ValidationException:
+   ... isn't supported. Retry your request with the ID or ARN of an inference
+   profile`. Fixing the underlying exception (not CORS) is the fix — see the next
+   entry.
+
+### Bedrock call fails with "on-demand throughput isn't supported"
+
+**Symptoms**: orchestrator pod logs (see previous entry) show:
+
+```
+botocore.errorfactory.ValidationException: An error occurred (ValidationException) when calling the
+Converse operation: Invocation of model ID anthropic.claude-sonnet-4-6 with on-demand throughput isn't
+supported. Retry your request with the ID or ARN of an inference profile that contains this model.
+```
+
+**Root cause**: this model requires a **cross-region inference profile ID**
+(`us.<model-id>`), not the bare foundation-model ID, for on-demand invocation.
+`infra/k8s/orchestrator/deployment.yaml`'s `BEDROCK_MODEL_ID` was set to the bare
+ID; `.vscode/launch.json` already uses the correct `us.`-prefixed form for local
+dev, which is what diverged.
+
+**Fix**: two changes together, since they're two different resource types:
+
+1. `infra/k8s/orchestrator/deployment.yaml` — set `BEDROCK_MODEL_ID` to
+   `us.anthropic.claude-sonnet-4-6`, then re-apply (see step 7) and confirm the
+   rollout as above.
+2. `infra/cloudformation/irsa-roles.yaml`'s `BedrockInvoke` policy only grants
+   `bedrock:InvokeModel`/`InvokeModelWithResponseStream` on
+   `arn:aws:bedrock:${AWS::Region}::foundation-model/*`. An inference profile is a
+   *separate* resource type (`arn:aws:bedrock:<region>:<account>:inference-profile/*`)
+   and a cross-region profile can route to foundation models in other US regions
+   too — add an `inference-profile/*` resource to the policy (and consider
+   widening the `foundation-model` resource to the other regions the `us.` profile
+   spans) and redeploy `irsa-roles.yaml`, or the ValidationException just becomes
+   an AccessDenied instead.
+
+### Chatbot replies with a generic "technical issue" apology instead of real data
+
+**Symptoms**: the chat UI itself loads fine and `/chat` returns `200 OK` (check
+with the log command above) — no CORS error, no 500 — but the assistant's reply
+is a vague apology like "our catalog service is temporarily unavailable due to a
+technical issue on our end" instead of actually answering.
+
+**Root cause**: LangGraph's tool-calling node catches exceptions raised by MCP
+tool calls and feeds the error back to the model as text rather than raising it,
+so **nothing shows up as an ERROR in the orchestrator's own pod logs** — this is
+by design (graceful degradation), not a bug, which makes it easy to mistake for
+"nothing is wrong here." The actual failure is one hop further downstream, in
+gateway-mcp or the mock backend services it calls. Trace it:
+
+1. Match the wording in the apology to a tool name in
+   `services/orchestrator/app/mcp_client.py` (e.g. "catalog" → `get_catalog`,
+   in `TRANSACTIONAL_TOOLS`) to know which service to check next.
+2. Confirm gateway-mcp itself is reachable (not the cause if these succeed):
+   ```bash
+   curl -s -o /dev/null -w "HTTP %{http_code}\n" "http://<gateway-mcp-alb-dns>/health"   # expect 200
+   aws ecs describe-services --region us-east-1 --cluster vfz-poc-gateway \
+     --services <service-arns> --query 'services[].{Name:serviceName,Desired:desiredCount,Running:runningCount}'
+   ```
+3. Pull gateway-mcp's CloudWatch logs for the failing outbound call. **On
+   Windows/Git Bash, prefix with `MSYS_NO_PATHCONV=1`** — otherwise MSYS silently
+   rewrites the leading `/ecs/...` log group name into a Windows path and `aws
+   logs` fails with a confusing `InvalidParameterException` about the name
+   pattern:
+   ```bash
+   MSYS_NO_PATHCONV=1 aws logs filter-log-events --region us-east-1 \
+     --log-group-name "/ecs/vfz-poc/gateway-mcp" \
+     --start-time <epoch-millis-of-window-start> \
+     --filter-pattern "?ERROR ?Error ?Exception ?Traceback" \
+     --query 'events[].message' --output text
+   ```
+   This shows which downstream call actually failed, e.g.
+   `GET http://mock-bluemarble.gateway.internal:8081/catalog "HTTP/1.1 500 Internal Server Error"`.
+4. Pull the same way from the mock service's own log group
+   (`/ecs/vfz-poc/mock-bluemarble` or `/ecs/vfz-poc/mock-salesforce`) to get the
+   actual traceback, e.g.
+   `asyncpg.exceptions.UndefinedTableError: relation "bluemarble.product_offering" does not exist`.
+
+**Fix (for the `UndefinedTableError` case specifically)**: the RDS instance
+was never seeded with `db/init/*.sql` — see "11. Seed the database" above for
+the full bastion setup and script run. `scripts/seed_db.py --check` verifies
+afterward that the expected rows exist.
 
 ## Verification
 
