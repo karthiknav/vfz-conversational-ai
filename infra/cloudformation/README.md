@@ -212,7 +212,8 @@ helm install aws-load-balancer-controller eks/aws-load-balancer-controller \
 helm repo add secrets-store-csi-driver https://kubernetes-sigs.github.io/secrets-store-csi-driver/charts
 helm install csi-secrets-store secrets-store-csi-driver/secrets-store-csi-driver \
   -n kube-system \
-  --set tokenRequests[0].audience=sts.amazonaws.com
+  --set tokenRequests[0].audience=sts.amazonaws.com \
+  --set syncSecret.enabled=true
 kubectl apply -f https://raw.githubusercontent.com/aws/secrets-store-csi-driver-provider-aws/main/deployment/aws-provider-installer.yaml
 
 helm repo add metrics-server https://kubernetes-sigs.github.io/metrics-server/
@@ -246,6 +247,36 @@ without this flag, fixing it means `helm uninstall csi-secrets-store -n
 kube-system && kubectl delete csidriver secrets-store.csi.k8s.io`, then
 reinstalling with the flag above — a plain `helm upgrade` won't patch the
 field in place.
+
+`--set syncSecret.enabled=true` is also required, not cosmetic, but unlike
+`tokenRequests` it's a normal (mutable) value — a plain `helm upgrade` with
+the flag fixes it if it was missed, no reinstall needed. Without it the CSI
+volume still mounts fine and ASCP still fetches the objects into
+`/mnt/secrets-store` with no errors in its logs, but the driver never
+creates the derived Kubernetes `Secret` described below — the orchestrator
+Deployment's `envFrom.secretRef` then fails pod creation with `Error:
+secret "orchestrator-secrets" not found`, which is easy to misread as an
+ASCP/IRSA problem when the actual fetch worked. Confirm the secret exists
+before chasing anything else:
+
+```bash
+kubectl get secret orchestrator-secrets -n orchestrator
+# NotFound here + clean ASCP daemonset logs == missing syncSecret.enabled
+```
+
+If you have to add the flag after the fact, restart the orchestrator pods
+afterward so they remount and trigger the sync — a Secret's absence isn't
+watched, so existing pods won't self-heal:
+
+```bash
+helm upgrade csi-secrets-store secrets-store-csi-driver/secrets-store-csi-driver \
+  -n kube-system \
+  --set tokenRequests[0].audience=sts.amazonaws.com \
+  --set syncSecret.enabled=true
+
+kubectl rollout restart deployment/orchestrator -n orchestrator
+kubectl rollout status deployment/orchestrator -n orchestrator
+```
 
 **How secrets actually get to the orchestrator pod:** the two `secrets-store-csi-driver`
 commands above install two separate DaemonSets, not one — the generic CSI driver
@@ -333,6 +364,32 @@ with `ALLOWED_ORIGINS` blank, deploy `ui.yaml`, then re-run this loop with
 `UI_CLOUDFRONT_URL` set and `kubectl apply` again (idempotent, only patches
 the Deployment's env).
 
+**Checking rollout health / restarting the orchestrator.** After any
+`kubectl apply` (or a Helm change upstream, like the `syncSecret` one
+above), confirm the new pods actually came up rather than assuming the
+apply succeeding means the rollout did:
+
+```bash
+kubectl rollout status deployment/orchestrator -n orchestrator   # blocks until Ready or errors out
+kubectl get pods -n orchestrator -o wide                         # STATUS column: CrashLoopBackOff, CreateContainerConfigError, etc.
+kubectl describe pod -n orchestrator -l app=orchestrator          # Events: at the bottom has the actual failure reason
+kubectl logs -n orchestrator -l app=orchestrator --all-containers --tail=100
+kubectl logs -n kube-system -l app=csi-secrets-store-provider-aws --tail=100  # ASCP-side fetch errors
+```
+
+To force pods to re-pull secrets/config without changing the manifest
+(e.g. after a Secrets Manager rotation, or the `syncSecret` fix above —
+neither is watched, so existing pods won't pick it up on their own):
+
+```bash
+kubectl rollout restart deployment/orchestrator -n orchestrator
+kubectl rollout status deployment/orchestrator -n orchestrator
+```
+
+If a rollout is stuck or bad, `kubectl rollout undo deployment/orchestrator
+-n orchestrator` returns to the previous ReplicaSet; `kubectl rollout
+history deployment/orchestrator -n orchestrator` lists revisions.
+
 ### 8. ui
 
 No CloudFormation dependencies, but must be deployed last: the S3 sync
@@ -349,16 +406,36 @@ aws cloudformation deploy \
   --parameter-overrides EnvironmentName=vfz-poc \
   --region us-east-1
 
-# get the orchestrator Ingress's ALB hostname (noted in step 7)
+# The UI is a static bundle with no server-side templating, so the
+# orchestrator's URL has to be baked into index.html at build time — there's
+# nowhere else for the browser to learn it at runtime. That's the ALB
+# hostname CloudFormation isn't aware of, since it's created by the
+# `orchestrator` Ingress (Kubernetes), not by ui.yaml — hence reading it
+# with kubectl instead of an `aws cloudformation describe-stacks` output.
 ALB_HOSTNAME=$(kubectl get ingress orchestrator -n orchestrator \
   -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
 
-# inject it into index.html's inline script, same sed buildspec.yml runs —
-# do this on a scratch copy, or `git checkout -- services/ui/index.html`
-# afterward, so the real ALB hostname never gets committed
+# index.html ships with a placeholder comment (see the block right before
+# `<script type="module" src="/src/main.js">`) documenting the injection
+# this sed performs: it inserts a second inline
+# `<script>window.ORCHESTRATOR_BASE_URL = "http://<ALB_HOSTNAME>";</script>`
+# tag immediately before that module script tag, so widget/chat.js sees the
+# global already set when it loads. This is exactly the sed buildspec.yml
+# runs on every push (services/ui/buildspec.yml) — running it by hand here
+# just reproduces CI's build step locally.
+#
+# HTTP, not HTTPS: this POC's ALB has no ACM cert / custom domain, so the
+# orchestrator is only reachable over plain HTTP (see ingress.yaml's note).
+#
+# Because sed edits index.html in place, this leaves the real ALB hostname
+# sitting in a tracked file — don't commit it. Either run this against a
+# scratch copy of the repo, or (as below) run `git checkout --
+# services/ui/index.html` right after the build to restore the placeholder.
 sed -i "s#<script type=\"module\" src=\"/src/main.js\"></script>#<script>window.ORCHESTRATOR_BASE_URL = \"http://${ALB_HOSTNAME}\";</script>\n  <script type=\"module\" src=\"/src/main.js\"></script>#" \
   services/ui/index.html
 
+# Builds the patched index.html (and the rest of services/ui/src) into
+# services/ui/dist via Vite — see services/ui/buildspec.yml's `build` phase.
 cd services/ui && npm ci && npm run build && cd ../..
 
 aws s3 sync services/ui/dist s3://<ui UiBucketName output> --delete

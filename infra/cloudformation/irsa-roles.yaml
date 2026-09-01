@@ -93,6 +93,11 @@ Resources:
                   - !ImportValue { "Fn::Sub": "${AppSecretsStackName}-GatewayApiKeySecretArn" }
                   - !ImportValue { "Fn::Sub": "${AppSecretsStackName}-LangfuseSecretArn" }
                   - !ImportValue { "Fn::Sub": "${DataStackName}-DbSecretArn" }
+              - Effect: Allow
+                # secret-provider-class.yaml also pulls GATEWAY_MCP_URL from this
+                # SSM parameter (published by gateway-services.yaml) via ASCP.
+                Action: ["ssm:GetParameter", "ssm:GetParameters"]
+                Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${EnvironmentName}/gateway-mcp-url"
 
   # AWS-published policy for the LB Controller (v2.8+); trimmed to what the
   # controller actually needs is out of scope for a POC — use the reference
