@@ -1,9 +1,10 @@
 # Requires the AWS Load Balancer Controller installed cluster-wide first —
-# see infra/k8s/README.md "Cluster bootstrap". Creates a public ALB; no ACM
-# certificate wired up here (POC, no custom domain) — HTTP only. Add
-# alb.ingress.kubernetes.io/certificate-arn once a domain + ACM cert exist,
-# and add the CloudFront domain to CORS allow_origins in
-# services/orchestrator/app/api.py before that ALB is UI-facing.
+# see infra/k8s/README.md "Cluster bootstrap". Creates a public ALB with
+# both an HTTP listener (redirecting to HTTPS) and an HTTPS listener using
+# the ACM cert from infra/cloudformation/orchestrator-tls.yaml. The Route53
+# alias record pointing that cert's domain at this ALB isn't created here —
+# the ALB doesn't exist until this Ingress is applied, so it's a separate
+# step after the fact (see infra/cloudformation/README.md step 7).
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
@@ -13,7 +14,9 @@ metadata:
     alb.ingress.kubernetes.io/scheme: internet-facing
     alb.ingress.kubernetes.io/target-type: ip
     alb.ingress.kubernetes.io/healthcheck-path: /health
-    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 80}]'
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 80}, {"HTTPS": 443}]'
+    alb.ingress.kubernetes.io/certificate-arn: __ORCHESTRATOR_CERT_ARN__
+    alb.ingress.kubernetes.io/ssl-redirect: "443"
 spec:
   ingressClassName: alb
   rules:

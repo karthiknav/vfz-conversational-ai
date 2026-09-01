@@ -22,7 +22,7 @@ parameter **by** `gateway-services.yaml` itself, not by `app-secrets.yaml`.
 1. network.yaml
 2. eks-cluster.yaml            (parallel with 3)
 3. gateway-ecs-cluster.yaml    (parallel with 2)
-4. eks-nodegroup.yaml, data.yaml, ecr.yaml, app-secrets.yaml   (parallel, all depend only on 1-3)
+4. eks-nodegroup.yaml, orchestrator-tls.yaml, data.yaml, ecr.yaml, app-secrets.yaml   (parallel, all depend only on 1-3, orchestrator-tls.yaml on nothing at all)
    -- build & push all 4 images to the ECR repos from step 4 --
 5. gateway-services.yaml       (creates the GATEWAY_MCP_URL SSM parameter as an output)
 6. irsa-roles.yaml             (needs LoadBalancerControllerPolicyArn — see below)
@@ -85,9 +85,9 @@ aws cloudformation deploy \
   --region us-east-1
 ```
 
-### 4. eks-nodegroup, data, ecr, app-secrets (parallel)
+### 4. eks-nodegroup, orchestrator-tls, data, ecr, app-secrets (parallel)
 
-All four depend only on stacks 1–3 (or nothing) and can be deployed
+All five depend only on stacks 1–3 (or nothing at all) and can be deployed
 concurrently.
 
 ```bash
@@ -97,6 +97,17 @@ aws cloudformation deploy \
   --template-file eks-nodegroup.yaml \
   --parameter-overrides EnvironmentName=vfz-poc NetworkStackName=vfz-network EksClusterStackName=vfz-eks-cluster \
   --capabilities CAPABILITY_NAMED_IAM \
+  --region us-east-1
+
+# orchestrator-tls — no dependency on any other stack here; needs an
+# existing Route53 hosted zone you already control (not created by this
+# repo). Find its ID with `aws route53 list-hosted-zones`.
+aws cloudformation deploy \
+  --stack-name vfz-orchestrator-tls \
+  --template-file orchestrator-tls.yaml \
+  --parameter-overrides EnvironmentName=vfz-poc \
+    DomainName=orchestrator.<your-domain> \
+    HostedZoneId=<hosted zone id for your-domain> \
   --region us-east-1
 
 # data — depends on network + eks-cluster (for the EKS-side DB ingress rule)
@@ -343,6 +354,7 @@ export BEDROCK_GUARDRAIL_ID=<observability guardrail id, or blank>
 export DB_ENDPOINT=<data DbEndpoint output>
 export DB_PORT=<data DbPort output>
 export UI_CLOUDFRONT_URL=<ui UiUrl output>   # only known after step 8 — see note below
+export ORCHESTRATOR_CERT_ARN=<orchestrator-tls CertificateArn output>
 
 for f in infra/k8s/orchestrator/*.yaml; do
   envsubst < "$f" | sed \
@@ -353,16 +365,47 @@ for f in infra/k8s/orchestrator/*.yaml; do
     -e "s#__DB_ENDPOINT__#$DB_ENDPOINT#" \
     -e "s#__DB_PORT__#$DB_PORT#" \
     -e "s#__UI_CLOUDFRONT_URL__#$UI_CLOUDFRONT_URL#" \
+    -e "s#__ORCHESTRATOR_CERT_ARN__#$ORCHESTRATOR_CERT_ARN#" \
     | kubectl apply -f -
 done
 ```
 
 `UI_CLOUDFRONT_URL` isn't known until after `ui.yaml` deploys (step 8), and
-`ui.yaml`'s build in turn needs the orchestrator's Ingress ALB hostname
-(known only after this step) — so in practice: apply the manifests once
-with `ALLOWED_ORIGINS` blank, deploy `ui.yaml`, then re-run this loop with
-`UI_CLOUDFRONT_URL` set and `kubectl apply` again (idempotent, only patches
-the Deployment's env).
+`ui.yaml`'s build in turn needs the orchestrator's HTTPS domain (known once
+the alias record below is created) — so in practice: apply the manifests
+once with `ALLOWED_ORIGINS` blank, deploy `ui.yaml`, then re-run this loop
+with `UI_CLOUDFRONT_URL` set and `kubectl apply` again (idempotent, only
+patches the Deployment's env).
+
+**Pointing the domain at the ALB.** `ingress.yaml`'s ALB doesn't exist until
+this `kubectl apply` runs, so the Route53 alias record for
+`orchestrator-tls.yaml`'s domain can't be created any earlier — this is a
+manual step, not something `orchestrator-tls.yaml` itself can do:
+
+```bash
+ALB_HOSTNAME=$(kubectl get ingress orchestrator -n orchestrator \
+  -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+ALB_ZONE_ID=$(aws elbv2 describe-load-balancers --region us-east-1 \
+  --query "LoadBalancers[?DNSName=='${ALB_HOSTNAME}'].CanonicalHostedZoneId" --output text)
+
+aws route53 change-resource-record-sets \
+  --hosted-zone-id <HostedZoneId param from orchestrator-tls.yaml> \
+  --change-batch '{
+    "Changes": [{
+      "Action": "UPSERT",
+      "ResourceRecordSet": {
+        "Name": "'"$ORCHESTRATOR_DOMAIN"'",
+        "Type": "A",
+        "AliasTarget": { "HostedZoneId": "'"$ALB_ZONE_ID"'", "DNSName": "'"$ALB_HOSTNAME"'", "EvaluateTargetHealth": false }
+      }
+    }]
+  }'
+```
+
+Re-run this (idempotent, `UPSERT`) any time the Ingress is recreated and
+gets a new ALB — the domain is otherwise stable across recreations, but
+only if this record is kept in sync by hand; nothing here watches for that
+automatically.
 
 **Checking rollout health / restarting the orchestrator.** After any
 `kubectl apply` (or a Helm change upstream, like the `syncSecret` one
@@ -408,30 +451,28 @@ aws cloudformation deploy \
 
 # The UI is a static bundle with no server-side templating, so the
 # orchestrator's URL has to be baked into index.html at build time — there's
-# nowhere else for the browser to learn it at runtime. That's the ALB
-# hostname CloudFormation isn't aware of, since it's created by the
-# `orchestrator` Ingress (Kubernetes), not by ui.yaml — hence reading it
-# with kubectl instead of an `aws cloudformation describe-stacks` output.
-ALB_HOSTNAME=$(kubectl get ingress orchestrator -n orchestrator \
-  -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+# nowhere else for the browser to learn it at runtime. Use the fixed HTTPS
+# domain from orchestrator-tls.yaml, not the raw ALB hostname: the browser
+# will hard-block the request as mixed content otherwise, since this UI is
+# served over HTTPS (CloudFront) and a plain-HTTP ALB call from an HTTPS
+# page is blocked before it's even sent — not a CORS error, no response to
+# debug, just a silently failed fetch.
+export ORCHESTRATOR_DOMAIN=orchestrator.<your-domain>   # orchestrator-tls DomainName output
 
 # index.html ships with a placeholder comment (see the block right before
 # `<script type="module" src="/src/main.js">`) documenting the injection
 # this sed performs: it inserts a second inline
-# `<script>window.ORCHESTRATOR_BASE_URL = "http://<ALB_HOSTNAME>";</script>`
+# `<script>window.ORCHESTRATOR_BASE_URL = "https://<ORCHESTRATOR_DOMAIN>";</script>`
 # tag immediately before that module script tag, so widget/chat.js sees the
-# global already set when it loads. This is exactly the sed buildspec.yml
-# runs on every push (services/ui/buildspec.yml) — running it by hand here
-# just reproduces CI's build step locally.
+# global already set when it loads. This is exactly what services/ui/buildspec.yml
+# runs on every push — running it by hand here just reproduces CI's build
+# step locally.
 #
-# HTTP, not HTTPS: this POC's ALB has no ACM cert / custom domain, so the
-# orchestrator is only reachable over plain HTTP (see ingress.yaml's note).
-#
-# Because sed edits index.html in place, this leaves the real ALB hostname
+# Because sed edits index.html in place, this leaves the real domain
 # sitting in a tracked file — don't commit it. Either run this against a
 # scratch copy of the repo, or (as below) run `git checkout --
 # services/ui/index.html` right after the build to restore the placeholder.
-sed -i "s#<script type=\"module\" src=\"/src/main.js\"></script>#<script>window.ORCHESTRATOR_BASE_URL = \"http://${ALB_HOSTNAME}\";</script>\n  <script type=\"module\" src=\"/src/main.js\"></script>#" \
+sed -i "s#<script type=\"module\" src=\"/src/main.js\"></script>#<script>window.ORCHESTRATOR_BASE_URL = \"https://${ORCHESTRATOR_DOMAIN}\";</script>\n  <script type=\"module\" src=\"/src/main.js\"></script>#" \
   services/ui/index.html
 
 # Builds the patched index.html (and the rest of services/ui/src) into
@@ -494,6 +535,7 @@ aws cloudformation deploy \
   --stack-name vfz-cicd-pipeline-ui \
   --template-file cicd-pipeline-ui.yaml \
   --parameter-overrides EnvironmentName=vfz-poc RepoOwner=<your-github-org-or-user> \
+    OrchestratorDomain=orchestrator.<your-domain> \
   --capabilities CAPABILITY_NAMED_IAM \
   --region us-east-1
 ```
@@ -647,6 +689,25 @@ subnets.
 - `NodeGroup` — `t3.medium` by default, 2/2/4 (min/desired/max), AL2023
   x86_64 AMI, `MaxUnavailable: 1` on rolling updates, using
   `NodeLaunchTemplate` above.
+
+### orchestrator-tls.yaml
+
+An ACM certificate for the orchestrator's ALB, DNS-validated via an
+existing Route53 hosted zone you already control — `HostedZoneId` and
+`DomainName` are both required parameters with no default, since they're
+specific to whatever domain you own. No dependency on any other stack;
+CloudFormation itself creates the validation CNAME in that hosted zone and
+blocks stack creation until ACM reports the cert `ISSUED`, so there's no
+manual "paste this CNAME into your DNS provider" step. Deliberately a
+separate stack from `eks-nodegroup.yaml`/`eks-cluster.yaml` since it has
+nothing to do with EKS — it exists purely because a plain-HTTP ALB serving
+a UI loaded over HTTPS (CloudFront) triggers the browser's mixed-content
+block: an HTTPS page can't `fetch()` a plain-HTTP endpoint at all, not even
+as a CORS failure — the request never leaves the browser. `ingress.yaml`
+below consumes this stack's `CertificateArn` output; the domain itself
+still needs a Route53 alias record pointed at the ALB after the fact (step
+7 in the deploy instructions), since the ALB doesn't exist until the
+Ingress is applied.
 
 ### gateway-ecs-cluster.yaml
 
@@ -873,10 +934,13 @@ substituted from CloudFormation outputs before `kubectl apply` — see the
   actual public entry point.
 - **ingress.yaml** — an ALB `Ingress` provisioned by the AWS Load Balancer
   Controller, internet-facing, `target-type: ip`, health check on
-  `/health`, HTTP-only on port 80 (no ACM cert wired up — POC, no custom
-  domain). Its ALB's DNS name is the "Ingress ALB hostname" referenced
-  throughout steps 7-8 and consumed by `ui.yaml`'s build and
-  `cicd-pipeline-ui.yaml`.
+  `/health`, listening on both port 80 (redirected to 443 via
+  `alb.ingress.kubernetes.io/ssl-redirect`) and 443 using
+  `orchestrator-tls.yaml`'s `CertificateArn`. The ALB's DNS name itself is
+  never referenced directly by the UI build — `orchestrator-tls.yaml`'s
+  fixed domain is, once step 7's Route53 alias record points it at this
+  ALB — precisely so a UI served over HTTPS (CloudFront) doesn't get its
+  `fetch()` calls blocked as mixed content.
 - **hpa.yaml** — a `HorizontalPodAutoscaler` targeting the Deployment,
   2-6 replicas, scaling on 70% average CPU utilization; requires
   metrics-server (installed in "Cluster bootstrap") to supply the
@@ -938,15 +1002,15 @@ shift, so blue/green would add infra for no benefit there).
 
 ### cicd-pipeline-ui.yaml
 
-Triggered only by pushes to `services/ui/**`. Build stage reads the
-orchestrator's Ingress ALB hostname live via `kubectl get ingress`
-(read-only `AmazonEKSViewPolicy` access entry, scoped to the
-`orchestrator` namespace — same reasoning as cicd-pipeline-eks.yaml's
-access entry, just view instead of edit), injects it into
-`services/ui/index.html` as `window.ORCHESTRATOR_BASE_URL`, then runs
-`npm run build`. Deploy stage syncs `dist/` to the UI bucket and
-invalidates CloudFront. Deliberately re-reads the ALB hostname on every
-run instead of caching it, since recreating the Ingress would change it.
+Triggered only by pushes to `services/ui/**`. Build stage injects the
+fixed `OrchestratorDomain` parameter (orchestrator-tls.yaml's domain, not
+the ALB's own hostname) into `services/ui/index.html` as
+`window.ORCHESTRATOR_BASE_URL`, then runs `npm run build`. Deploy stage
+syncs `dist/` to the UI bucket and invalidates CloudFront. Unlike the ALB
+hostname, this domain doesn't change when the Ingress is recreated (as
+long as step 7's Route53 alias record is kept pointed at the current ALB
+by hand), so this pipeline needs no EKS API access at all — no
+`kubectl`, no access entry, no `eks:DescribeCluster`.
 
 ## Troubleshooting
 
@@ -1019,6 +1083,38 @@ aws cloudformation describe-stack-resources --stack-name vfz-eks-nodegroup \
 3. After either fix, the crash-looping controller pod recovers on its own
    restart, and any pending Ingress gets an `ADDRESS` on its next reconcile
    (a few seconds) with no other action needed.
+
+### UI shows "Failed to fetch" with a Mixed Content error in the console
+
+**Symptoms**: the chat widget silently fails; DevTools Console (not
+Network — a blocked request often shows no useful status there) has:
+
+```
+Mixed Content: The page at 'https://<cloudfront-domain>/' was loaded over HTTPS,
+but requested an insecure resource 'http://<alb-hostname>/chat'. This request
+has been blocked; the content must be served over HTTPS.
+```
+
+**Root cause**: the UI is served over HTTPS (CloudFront), and
+`window.ORCHESTRATOR_BASE_URL` was built pointing at the ALB's plain-HTTP
+hostname directly instead of `orchestrator-tls.yaml`'s HTTPS domain.
+Browsers block this outright before the request is even sent — it isn't a
+CORS error, and the Network tab won't show a status code or response
+headers for it, just an immediate failure.
+
+**Fix**: confirm `services/ui/index.html`'s injected
+`window.ORCHESTRATOR_BASE_URL` (view page source on the deployed site, or
+check what `services/ui/buildspec.yml`'s `ORCHESTRATOR_DOMAIN` env var was
+set to for that build) uses `https://` and `orchestrator-tls.yaml`'s
+domain, not `http://<alb-hostname>`. If it's pointing at the ALB hostname,
+that's a build that predates this fix, or ran with `ORCHESTRATOR_DOMAIN`
+unset/wrong — rebuild and redeploy the UI (step 8) with it set correctly.
+If the domain looks right but still fails, confirm the Route53 alias
+record actually resolves to the *current* ALB (`dig <your-domain>` should
+match `kubectl get ingress orchestrator -n orchestrator -o jsonpath='{.status.loadBalancer.ingress[0].hostname}'`
+via a `CNAME`/A-alias chain) — the record goes stale if the Ingress was
+ever recreated without also re-running step 7's `route53
+change-resource-record-sets`.
 
 ## Verification
 

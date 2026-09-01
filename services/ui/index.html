@@ -160,11 +160,12 @@
   </div>
 
   <!-- AWS phase (EKS): the deploy step should inject the orchestrator's
-       Ingress ALB hostname here before `npm run build` + S3 sync, e.g.
-       <script>window.ORCHESTRATOR_BASE_URL = "https://...";</script>
-       See infra/k8s/orchestrator/ingress.yaml and infra/cloudformation/ui.yaml.
-       Defaults to http://localhost:8000 for local docker-compose. Must stay
-       BEFORE the module script below so widget/chat.js picks it up. -->
+       fixed HTTPS domain here before `npm run build` + S3 sync, e.g.
+       <script>window.ORCHESTRATOR_BASE_URL = "https://orchestrator.<your-domain>";</script>
+       See infra/cloudformation/orchestrator-tls.yaml, infra/k8s/orchestrator/ingress.yaml,
+       and infra/cloudformation/ui.yaml. Defaults to http://localhost:8000 for
+       local docker-compose. Must stay BEFORE the module script below so
+       widget/chat.js picks it up. -->
   <script type="module" src="/src/main.js"></script>
 </body>
 </html>

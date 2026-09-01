@@ -1,12 +1,14 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >
   CodePipeline for the static chat UI. Only fires on pushes to
-  `services/ui/**`. Build stage reads the orchestrator's Ingress ALB
-  hostname live from the EKS API (kubectl get ingress), injects it into
-  index.html as window.ORCHESTRATOR_BASE_URL, then runs `npm run build`.
-  Deploy stage syncs dist/ to the UI's S3 bucket and invalidates
-  CloudFront. Deliberately re-reads the ALB hostname on every run instead
-  of caching it, since an Ingress recreation would change it.
+  `services/ui/**`. Build stage injects the orchestrator's fixed HTTPS
+  domain (OrchestratorDomain, from infra/cloudformation/orchestrator-tls.yaml)
+  into index.html as window.ORCHESTRATOR_BASE_URL, then runs `npm run build`.
+  Deploy stage syncs dist/ to the UI's S3 bucket and invalidates CloudFront.
+  No EKS API access needed here — unlike the ALB's own hostname, this domain
+  is stable across Ingress/ALB recreation as long as the Route53 alias
+  record is kept pointed at the current ALB (a separate, manual step; see
+  infra/cloudformation/README.md step 7).
 
 Parameters:
   EnvironmentName:
@@ -15,9 +17,6 @@ Parameters:
   CicdFoundationStackName:
     Type: String
     Default: vfz-cicd-foundation
-  EksClusterStackName:
-    Type: String
-    Default: vfz-eks-cluster
   UiStackName:
     Type: String
     Default: vfz-ui
@@ -30,9 +29,11 @@ Parameters:
   BranchName:
     Type: String
     Default: main
-  OrchestratorNamespace:
+  OrchestratorDomain:
     Type: String
-    Default: orchestrator
+    Description: >
+      The orchestrator's HTTPS domain (DomainName output of
+      orchestrator-tls.yaml), e.g. orchestrator.<your-domain>.
 
 Resources:
   # --------------------------------------------------------------- build
@@ -54,22 +55,6 @@ Resources:
             Version: "2012-10-17"
             Statement:
               - { Effect: Allow, Action: ["logs:CreateLogStream", "logs:PutLogEvents"], Resource: !GetAtt BuildLogGroup.Arn }
-              - Effect: Allow
-                Action: eks:DescribeCluster
-                Resource: !Sub
-                  - "arn:aws:eks:${AWS::Region}:${AWS::AccountId}:cluster/${ClusterName}"
-                  - ClusterName: !ImportValue { "Fn::Sub": "${EksClusterStackName}-ClusterName" }
-
-  # Read-only k8s grant — this role only needs to `kubectl get ingress`, not
-  # edit anything, unlike cicd-pipeline-eks.yaml's DeployAccessEntry.
-  BuildAccessEntry:
-    Type: AWS::EKS::AccessEntry
-    Properties:
-      ClusterName: !ImportValue { "Fn::Sub": "${EksClusterStackName}-ClusterName" }
-      PrincipalArn: !GetAtt BuildRole.Arn
-      AccessPolicies:
-        - PolicyArn: arn:aws:eks::aws:cluster-access-policy/AmazonEKSViewPolicy
-          AccessScope: { Type: namespace, Namespaces: [!Ref OrchestratorNamespace] }
 
   BuildProject:
     Type: AWS::CodeBuild::Project
@@ -83,9 +68,7 @@ Resources:
         ComputeType: BUILD_GENERAL1_SMALL
         Image: aws/codebuild/standard:7.0
         EnvironmentVariables:
-          - { Name: EKS_CLUSTER_NAME, Value: !ImportValue { "Fn::Sub": "${EksClusterStackName}-ClusterName" } }
-          - { Name: ORCHESTRATOR_NAMESPACE, Value: !Ref OrchestratorNamespace }
-          - { Name: AWS_DEFAULT_REGION, Value: !Ref AWS::Region }
+          - { Name: ORCHESTRATOR_DOMAIN, Value: !Ref OrchestratorDomain }
       LogsConfig: { CloudWatchLogs: { GroupName: !Ref BuildLogGroup, Status: ENABLED } }
 
   # --------------------------------------------------------------- deploy

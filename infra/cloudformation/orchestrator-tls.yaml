@@ -1,0 +1,47 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  ACM certificate for the orchestrator's ALB, DNS-validated against an
+  existing Route53 hosted zone you already control. No dependency on any
+  other stack in this repo — the hosted zone predates this template and
+  isn't managed by it.
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: vfz-poc
+  DomainName:
+    Type: String
+    Description: >
+      The subdomain to certify for the orchestrator's ALB, e.g.
+      orchestrator.<your-domain>. Must NOT be the domain's apex if the apex
+      is already in use elsewhere (a new ACM certificate can't be merged
+      into one that's already issued for the apex - SANs are fixed at
+      issuance).
+  HostedZoneId:
+    Type: AWS::Route53::HostedZone::Id
+    Description: >
+      Route53 hosted zone that owns DomainName, e.g. the zone for
+      <your-domain>. Find it with `aws route53 list-hosted-zones`.
+
+Resources:
+  # CloudFormation creates the DNS validation CNAME in HostedZoneId itself
+  # and blocks stack creation until ACM reports ISSUED - no manual
+  # "copy this CNAME into Route53" step required.
+  OrchestratorCertificate:
+    Type: AWS::CertificateManager::Certificate
+    Properties:
+      DomainName: !Ref DomainName
+      ValidationMethod: DNS
+      DomainValidationOptions:
+        - DomainName: !Ref DomainName
+          HostedZoneId: !Ref HostedZoneId
+      Tags:
+        - { Key: Name, Value: !Sub "${EnvironmentName}-orchestrator-cert" }
+
+Outputs:
+  CertificateArn:
+    Value: !Ref OrchestratorCertificate
+    Export: { Name: !Sub "${AWS::StackName}-CertificateArn" }
+  DomainName:
+    Value: !Ref DomainName
+    Export: { Name: !Sub "${AWS::StackName}-DomainName" }
