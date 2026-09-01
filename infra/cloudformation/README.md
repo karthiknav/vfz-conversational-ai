@@ -948,6 +948,78 @@ access entry, just view instead of edit), injects it into
 invalidates CloudFront. Deliberately re-reads the ALB hostname on every
 run instead of caching it, since recreating the Ingress would change it.
 
+## Troubleshooting
+
+### ALB controller crash-loops, or an Ingress never gets an ADDRESS
+
+**Symptoms**: `kubectl get pods -n kube-system -l app.kubernetes.io/name=aws-load-balancer-controller`
+shows `CrashLoopBackOff`, with logs ending in:
+
+```
+unable to initialize AWS cloud: failed to get VPC ID: failed to fetch VPC ID from
+instance metadata: ... get mac metadata: ... context deadline exceeded
+```
+
+— or the controller pods themselves show `Running 1/1` (their readiness probe only
+checks the local webhook HTTP server, not AWS connectivity) but an `Ingress` sits
+with no `ADDRESS` indefinitely, and `kubectl describe ingress <name>` shows repeating
+events like:
+
+```
+FailedBuildModel ... DescribeLoadBalancers, get identity: get credentials:
+failed to refresh cached credentials, no EC2 IMDS role found, ...
+context deadline exceeded
+```
+
+**Root cause**: both errors are the same underlying failure — the pod can't reach
+the EC2 instance metadata service (IMDS, `169.254.169.254`). IMDSv2 has a
+`HttpPutResponseHopLimit` setting that caps how many network hops a metadata
+request can travel; traffic from *inside a pod's* network namespace takes one
+more hop than traffic from the host itself (the bridge/veth adds a hop), so a
+node with hop limit `1` serves IMDS fine to host-level processes but times out
+every in-pod call. The controller uses IMDS at startup to auto-discover its VPC
+ID, and (as a fallback credentials source) during reconciliation — both die the
+same way. `eks-nodegroup.yaml`'s `NodeLaunchTemplate` sets the hop limit to `2`
+precisely to prevent this, but **the fix only applies to nodes launched under
+that launch template** — check whether the deployed stack actually has it:
+
+```bash
+aws cloudformation describe-stack-resources --stack-name vfz-eks-nodegroup \
+  --query "StackResources[].LogicalResourceId"
+# No "NodeLaunchTemplate" in the list == the deployed stack predates the fix
+# (or was never updated since) and existing nodes were launched without it,
+# regardless of what's in the template file in this repo.
+```
+
+**Fix**:
+
+1. Redeploy the node group stack so its launch template (and thus the hop
+   limit) actually reaches AWS — safe to run any time, confirm first with a
+   change set if you want to see the plan before applying:
+   ```bash
+   aws cloudformation deploy --stack-name vfz-eks-nodegroup \
+     --template-file eks-nodegroup.yaml \
+     --parameter-overrides EnvironmentName=vfz-poc NetworkStackName=vfz-network EksClusterStackName=vfz-eks-cluster \
+     --capabilities CAPABILITY_NAMED_IAM --region us-east-1
+   ```
+   Attaching a launch template to a node group that didn't have one is an
+   in-place update (`Replacement: False`, `RequiresRecreation: Never`) — it
+   rolls the existing nodes one at a time per `UpdateConfig.MaxUnavailable: 1`,
+   not a full node group recreation.
+2. To unblock immediately without waiting on a stack deploy/node roll (e.g.
+   mid-incident), raise the hop limit on the live instances directly — takes
+   effect with no reboot:
+   ```bash
+   aws ec2 modify-instance-metadata-options --instance-id <id> \
+     --http-put-response-hop-limit 2 --http-tokens required
+   ```
+   This only patches already-running instances; it doesn't change the launch
+   template, so any node replaced later (scale-up, AMI upgrade, spot
+   interruption) reverts to hop limit `1` unless step 1 has also been applied.
+3. After either fix, the crash-looping controller pod recovers on its own
+   restart, and any pending Ingress gets an `ADDRESS` on its next reconcile
+   (a few seconds) with no other action needed.
+
 ## Verification
 
 See the "Verification" section of the approved plan
