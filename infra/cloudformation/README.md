@@ -653,8 +653,30 @@ aws ec2 authorize-security-group-ingress --region us-east-1 \
 
 **5. Start a port-forwarding session** — this tunnels a port on *your own
 machine* through the bastion to the RDS endpoint, so `psql` runs locally
-against `localhost:15432` and never needs installing on the bastion. Run this
-in its own terminal and leave it running:
+against `localhost:15432` and never needs installing on the bastion.
+
+`aws ssm start-session` shells out to a separate local binary
+(`session-manager-plugin`) to actually run the tunnel — it doesn't ship with
+the AWS CLI, so install it first if you haven't:
+
+```
+# Windows: download and run the installer, then restart your terminal (or add
+# it to PATH manually for the current shell) so it's picked up
+https://s3.amazonaws.com/session-manager-downloads/plugin/latest/windows/SessionManagerPluginSetup.exe
+export PATH="$PATH:/c/Program Files/Amazon/SessionManagerPlugin/bin"   # Git Bash, if PATH didn't refresh
+
+# macOS / Linux: see https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html
+```
+
+Verify it's on `PATH` (should print a version banner, not "command not found"):
+
+```bash
+session-manager-plugin
+```
+
+Run the tunnel in its own terminal and leave it running — it holds the
+connection open, so nothing else runs in this terminal until you `Ctrl+C` it
+at the end:
 
 ```bash
 aws ssm start-session --region us-east-1 --target "$INSTANCE_ID" \
@@ -662,8 +684,15 @@ aws ssm start-session --region us-east-1 --target "$INSTANCE_ID" \
   --parameters "{\"host\":[\"$DB_ENDPOINT\"],\"portNumber\":[\"5432\"],\"localPortNumber\":[\"15432\"]}"
 ```
 
-In a second terminal, fetch the master credentials and run the four scripts
-**in order** against the tunnel:
+Open a **second, separate terminal** for everything below — the credentials
+fetched here (`DB_USER`/`DB_PASSWORD`) only exist as shell variables in
+whichever terminal runs these commands, so if you close/reopen a terminal or
+switch windows, re-run this block before the `psql`/`seed_db.py` commands
+that depend on it. These pull the RDS master credentials out of the
+`vfz-poc/db-credentials` secret ([data.yaml:29-37](data.yaml#L29-L37) — the
+password is auto-generated at stack-create time, never hardcoded anywhere) —
+requires `jq` to parse the secret's JSON, so install that first if it's
+missing (`choco install jq` / `brew install jq` / `apt install jq`):
 
 ```bash
 DB_USER=$(aws secretsmanager get-secret-value --region us-east-1 \
@@ -678,14 +707,15 @@ for f in db/init/001_audit_trail.sql db/init/002_bluemarble_salesforce_schemas.s
 done
 ```
 
-Verify it landed:
+Verify it landed (same terminal, so `$DB_USER`/`$DB_PASSWORD` are still set):
 
 ```bash
 POSTGRES_HOST=localhost POSTGRES_PORT=15432 POSTGRES_USER="$DB_USER" \
   POSTGRES_PASSWORD="$DB_PASSWORD" POSTGRES_DB=vfz_poc python scripts/seed_db.py --check
 ```
 
-Then `Ctrl+C` the `start-session` terminal to close the tunnel.
+Then switch back to the first terminal and `Ctrl+C` the `start-session` to
+close the tunnel.
 
 **6. Tear down** — nothing from this section should outlive the seeding run:
 

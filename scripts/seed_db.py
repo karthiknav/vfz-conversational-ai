@@ -12,17 +12,14 @@ import sys
 
 import asyncpg
 
-DSN = (
-    f"postgresql://{os.environ.get('POSTGRES_USER', 'vz_poc')}:"
-    f"{os.environ.get('POSTGRES_PASSWORD', 'change-me-locally')}"
-    f"@{os.environ.get('POSTGRES_HOST', 'localhost')}:"
-    f"{os.environ.get('POSTGRES_PORT', '5432')}/"
-    f"{os.environ.get('POSTGRES_DB', 'vz_poc')}"
-)
-
-
 async def check() -> bool:
-    conn = await asyncpg.connect(DSN)
+    conn = await asyncpg.connect(
+        user=os.environ.get("POSTGRES_USER", "vz_poc"),
+        password=os.environ.get("POSTGRES_PASSWORD", "change-me-locally"),
+        host=os.environ.get("POSTGRES_HOST", "localhost"),
+        port=int(os.environ.get("POSTGRES_PORT", "5432")),
+        database=os.environ.get("POSTGRES_DB", "vz_poc"),
+    )
     ok = True
     try:
         offerings = await conn.fetch("SELECT id, monthly_price FROM bluemarble.product_offering ORDER BY id")
